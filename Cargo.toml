@@ -1,0 +1,28 @@
+[package]
+name = "ws-shard-manager"
+version = "0.1.0"
+edition = "2021"
+description = "A robust WebSocket connection manager with sharding, auto-reconnection, and hot switchover"
+license = "MIT"
+repository = "https://github.com/KaboomFox/ws-shard-manager"
+keywords = ["websocket", "sharding", "reconnection", "async"]
+categories = ["network-programming", "asynchronous"]
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+futures-util = "0.3"
+tracing = "0.1"
+thiserror = "1"
+rand = "0.8"
+parking_lot = "0.12"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ws-mock = "0.1"
+serde_json = "1.0"
+
+[[example]]
+name = "polymarket"
+path = "examples/polymarket.rs"
