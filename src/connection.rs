@@ -63,6 +63,7 @@ impl<H: WebSocketHandler> Connection<H> {
     }
 
     /// Create a new connection with a ready signal for hot switchover
+    #[allow(clippy::too_many_arguments)]
     pub fn with_ready_signal(
         shard_id: usize,
         handler: Arc<H>,

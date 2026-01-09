@@ -114,6 +114,19 @@ impl ShardManagerConfigBuilder {
             ));
         }
 
+        if self.config.health.data_timeout < self.config.health.ping_interval {
+            return Err(ConfigError::InvalidHealth(
+                "data_timeout should be >= ping_interval to avoid false positives".to_string(),
+            ));
+        }
+
+        // Validate connection config
+        if self.config.connection.circuit_breaker_threshold == 0 {
+            return Err(ConfigError::InvalidConnection(
+                "circuit_breaker_threshold must be > 0".to_string(),
+            ));
+        }
+
         // Validate max subscriptions
         if let Some(0) = self.config.max_subscriptions_per_shard {
             return Err(ConfigError::InvalidSubscriptionLimit(
@@ -134,6 +147,9 @@ pub enum ConfigError {
     /// Invalid health configuration
     #[error("Invalid health configuration: {0}")]
     InvalidHealth(String),
+    /// Invalid connection configuration
+    #[error("Invalid connection configuration: {0}")]
+    InvalidConnection(String),
     /// Invalid subscription limit
     #[error("Invalid subscription limit: {0}")]
     InvalidSubscriptionLimit(String),

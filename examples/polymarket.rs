@@ -143,7 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|i| format!("token-{}", i))
         .collect();
 
-    manager.subscribe_simple(new_tokens).await?;
+    manager.subscribe_all(new_tokens).await?;
     info!("Subscribed to 10 more tokens, total: {}", manager.total_subscriptions());
 
     // Run for a while

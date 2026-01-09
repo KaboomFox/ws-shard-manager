@@ -8,6 +8,7 @@ use futures_util::FutureExt;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -23,13 +24,21 @@ type ShardUnsubData<S> = (usize, Vec<S>, mpsc::Sender<ConnectionCommand>, usize)
 /// Timeout for waiting for new connection during hot switchover
 const HOT_SWITCHOVER_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Manages multiple WebSocket shards with auto-rebalancing and hot switchover
+/// Manages multiple WebSocket shards with auto-rebalancing and hot switchover.
+///
+/// # Thread Safety
+///
+/// `ShardManager` is `Send + Sync` and all methods can be safely called from
+/// multiple tasks concurrently. Internal state is protected by `parking_lot::RwLock`
+/// which does not poison on panic.
 pub struct ShardManager<H: WebSocketHandler> {
     handler: Arc<H>,
     config: ShardManagerConfig,
     metrics: Arc<Metrics>,
     state: Arc<RwLock<ManagerState<H::Subscription>>>,
     shard_handles: RwLock<Vec<JoinHandle<()>>>,
+    /// Monotonically increasing counter for shard IDs to prevent race conditions
+    next_shard_id: AtomicUsize,
 }
 
 struct ManagerState<S: Clone + Eq + std::hash::Hash> {
@@ -65,6 +74,7 @@ impl<H: WebSocketHandler> ShardManager<H> {
             metrics: Arc::new(Metrics::new()),
             state: Arc::new(RwLock::new(ManagerState::default())),
             shard_handles: RwLock::new(Vec::new()),
+            next_shard_id: AtomicUsize::new(0),
         }
     }
 
@@ -73,12 +83,32 @@ impl<H: WebSocketHandler> ShardManager<H> {
         self.metrics.clone()
     }
 
+    /// Check if the manager is currently running
+    pub fn is_running(&self) -> bool {
+        self.state.read().is_running
+    }
+
     /// Start the shard manager
     ///
     /// This will create the initial shards based on existing subscriptions
     /// from the handler. If there are no initial subscriptions, no shards
     /// are created until the first subscription is added (lazy creation).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manager is already running or if configuration
+    /// is invalid.
     pub async fn start(&self) -> Result<(), Error> {
+        // Check if already running
+        {
+            let state = self.state.read();
+            if state.is_running {
+                return Err(Error::Handler(
+                    "ShardManager is already running".to_string(),
+                ));
+            }
+        }
+
         let subscriptions = self.handler.subscriptions();
         let max_per_shard = self.max_per_shard();
 
@@ -103,8 +133,9 @@ impl<H: WebSocketHandler> ShardManager<H> {
             max_per_shard
         );
 
-        // Create shards
-        for shard_id in 0..shard_count {
+        // Create shards using atomic counter for IDs
+        for _ in 0..shard_count {
+            let shard_id = self.next_shard_id.fetch_add(1, Ordering::SeqCst);
             self.create_shard(shard_id).await?;
         }
 
@@ -199,6 +230,9 @@ impl<H: WebSocketHandler> ShardManager<H> {
             state.shards_being_created.clear();
         }
 
+        // Reset shard ID counter for potential restart
+        self.next_shard_id.store(0, Ordering::SeqCst);
+
         info!("ShardManager stopped");
         Ok(())
     }
@@ -270,8 +304,8 @@ impl<H: WebSocketHandler> ShardManager<H> {
                     Ok((shard_id, tx, sub_count))
                 }
                 None if self.config.auto_rebalance => {
-                    // Need to create new shard - reserve the ID to prevent race conditions
-                    let new_id = state.shards.len() + state.shards_being_created.len();
+                    // Need to create new shard - use atomic counter for thread-safe ID assignment
+                    let new_id = self.next_shard_id.fetch_add(1, Ordering::SeqCst);
                     state.shards_being_created.insert(new_id);
                     Err(new_id)
                 }
@@ -328,13 +362,30 @@ impl<H: WebSocketHandler> ShardManager<H> {
             .update_shard(shard_id, |s| s.subscription_count = sub_count);
 
         // Send subscribe message outside the lock
-        if let Some(msg) = self.handler.subscription_message(&[item]) {
+        if let Some(msg) = self.handler.subscription_message(std::slice::from_ref(&item)) {
             if let Err(e) = command_tx.send(ConnectionCommand::Send(msg)).await {
                 self.metrics.record_subscription_send_failed();
                 warn!(
                     "[SHARD-{}] Failed to send subscription message: {}",
                     shard_id, e
                 );
+
+                // Rollback: remove subscription from state so retry is possible
+                {
+                    let mut state = self.state.write();
+                    if let Some(shard) = state.shards.get_mut(shard_id) {
+                        shard.remove_subscription(&item);
+                    }
+                    state.subscription_to_shard.remove(&item);
+                }
+
+                // Update metrics to reflect rollback
+                let new_count = {
+                    let state = self.state.read();
+                    state.shards.get(shard_id).map(|s| s.subscription_count()).unwrap_or(0)
+                };
+                self.metrics.update_shard(shard_id, |s| s.subscription_count = new_count);
+
                 return SubscribeResult::SendFailed {
                     shard_id,
                     error: e.to_string(),
@@ -345,10 +396,16 @@ impl<H: WebSocketHandler> ShardManager<H> {
         SubscribeResult::Success { shard_id }
     }
 
-    /// Convenience method that returns only the shard IDs of successful subscriptions
+    /// Subscribe to items and return affected shard IDs.
     ///
-    /// This is a simpler API for cases where you don't need per-item error handling.
-    pub async fn subscribe_simple(&self, items: Vec<H::Subscription>) -> Result<Vec<usize>, Error> {
+    /// This is a convenience method that returns the shard IDs of successful
+    /// subscriptions. Use [`subscribe`] instead if you need per-item error details.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if all subscriptions fail. Partial success returns `Ok`
+    /// with the shard IDs that were affected.
+    pub async fn subscribe_all(&self, items: Vec<H::Subscription>) -> Result<Vec<usize>, Error> {
         let results = self.subscribe(items).await;
         let mut affected_shards_set = HashSet::new();
         let mut had_failure = false;

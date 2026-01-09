@@ -2,11 +2,17 @@ use parking_lot::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// Metrics for observability
+/// Metrics for observability.
 ///
 /// This struct provides counters and gauges for monitoring WebSocket health.
 /// Use `snapshot()` to get a point-in-time view of all metrics, or use
 /// individual getter methods for specific values.
+///
+/// # Thread Safety
+///
+/// `Metrics` is `Send + Sync` and all methods are safe to call from multiple
+/// tasks concurrently. Counters use atomic operations, and per-shard metrics
+/// are protected by `parking_lot::RwLock`.
 ///
 /// # Example
 /// ```ignore
@@ -319,24 +325,43 @@ impl Metrics {
     }
 }
 
-/// A point-in-time snapshot of all metrics
+/// A point-in-time snapshot of all metrics.
+///
+/// Use [`Metrics::snapshot()`] to get a consistent view of all metrics at once.
+/// This is the recommended way to export metrics to monitoring systems.
 #[derive(Debug, Clone)]
 pub struct MetricsSnapshot {
+    /// Total number of WebSocket connections established (including reconnections)
     pub connections_total: u64,
+    /// Total number of reconnection attempts after disconnection
     pub reconnections_total: u64,
+    /// Total number of WebSocket messages received across all shards
     pub messages_received_total: u64,
+    /// Total number of WebSocket messages sent across all shards
     pub messages_sent_total: u64,
+    /// Total number of errors encountered (connection failures, panics, etc.)
     pub errors_total: u64,
+    /// Total number of WebSocket ping frames sent for health monitoring
     pub pings_sent_total: u64,
+    /// Total number of WebSocket pong frames received
     pub pongs_received_total: u64,
+    /// Total number of health check failures (pong timeouts, data timeouts)
     pub health_failures_total: u64,
+    /// Total number of shard rebalancing operations (new shard creation)
     pub rebalances_total: u64,
+    /// Total number of hot switchover operations initiated
     pub hot_switchovers_total: u64,
+    /// Total number of hot switchover operations that failed
     pub hot_switchover_failures_total: u64,
+    /// Total number of subscription message send failures
     pub subscription_send_failures_total: u64,
+    /// Total number of times the circuit breaker tripped due to consecutive failures
     pub circuit_breaker_trips_total: u64,
+    /// Current number of active (connected) shards
     pub active_connections: usize,
+    /// Current total number of subscriptions across all shards
     pub total_subscriptions: usize,
+    /// Per-shard metrics with detailed connection state
     pub shards: Vec<ShardMetrics>,
 }
 
