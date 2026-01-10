@@ -9,6 +9,8 @@ A robust WebSocket connection manager for Rust with sharding, auto-reconnection,
 - **Hot switchover** - new connection established before old one closes
 - **Auto-rebalancing** when subscriptions exceed capacity
 - **Health monitoring** via ping/pong and data timeouts
+- **Multi-IP support** - distribute shards across source IPs to avoid rate limits
+- **Proxy support** - SOCKS5 and HTTP CONNECT proxy tunneling
 - **Metrics** for observability
 - **Panic recovery** - handler panics are caught and logged
 
@@ -99,6 +101,7 @@ let config = ShardManagerConfig::builder()
         connect_timeout: Duration::from_secs(10),
         max_connect_attempts: 10,
         proactive_reconnect_interval: Some(Duration::from_secs(15 * 60)),
+        ..Default::default()
     })
     // Reconnection backoff
     .backoff(BackoffConfig {
@@ -121,6 +124,67 @@ let config = ShardManagerConfig::builder()
     .auto_rebalance(true)
     .build();
 ```
+
+## Multi-IP Support
+
+Distribute connections across multiple source IPs to avoid per-IP rate limits:
+
+```rust
+let config = ShardManagerConfig::builder()
+    .connection(ConnectionConfig {
+        // Bind outgoing connections to these IPs (round-robin by shard)
+        source_ips: vec![
+            "192.0.2.10".to_string(),
+            "192.0.2.11".to_string(),
+            "192.0.2.12".to_string(),
+        ],
+        // Number of shards per IP before rotating to next
+        shards_per_ip: 10,
+        ..Default::default()
+    })
+    .build();
+
+// With 3 IPs × 10 shards/IP × 500 subscriptions/shard = 15,000 subscriptions
+```
+
+Shard-to-IP assignment:
+- Shards 0-9 → 192.0.2.10
+- Shards 10-19 → 192.0.2.11
+- Shards 20-29 → 192.0.2.12
+
+## Proxy Support
+
+Route connections through SOCKS5 or HTTP CONNECT proxies:
+
+```rust
+// SOCKS5 proxy
+let config = ShardManagerConfig::builder()
+    .connection(ConnectionConfig {
+        proxy: Some("socks5://proxy.example.com:1080".to_string()),
+        ..Default::default()
+    })
+    .build();
+
+// HTTP CONNECT proxy with authentication
+let config = ShardManagerConfig::builder()
+    .connection(ConnectionConfig {
+        proxy: Some("http://user:pass@proxy.example.com:8080".to_string()),
+        ..Default::default()
+    })
+    .build();
+
+// Combine proxy with source IP binding (HTTP CONNECT only)
+let config = ShardManagerConfig::builder()
+    .connection(ConnectionConfig {
+        proxy: Some("http://proxy.example.com:8080".to_string()),
+        source_ips: vec!["192.0.2.10".to_string()],
+        shards_per_ip: 10,
+        ..Default::default()
+    })
+    .build();
+```
+
+**Note:** Source IP binding with SOCKS5 proxies is not supported (the proxy handles the outbound connection).
 
 ## WebSocketHandler Trait
 
