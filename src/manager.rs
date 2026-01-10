@@ -818,7 +818,7 @@ impl<H: WebSocketHandler> ShardManager<H> {
         let (new_tx, new_rx) = mpsc::channel::<ConnectionCommand>(DEFAULT_CHANNEL_SIZE);
         let (ready_tx, ready_rx) = oneshot::channel();
 
-        // Create new connection with ready signal and explicit subscriptions
+        // Create new connection with ready signal, explicit subscriptions, and switchover channel
         let new_connection = Connection::with_ready_signal(
             shard_id,
             self.handler.clone(),
@@ -829,12 +829,18 @@ impl<H: WebSocketHandler> ShardManager<H> {
             new_rx,
             ready_tx,
             subscriptions,
+            self.switchover_tx.clone(),
         );
 
-        // Spawn new connection task
+        // Spawn new connection task with proper logging
         let handle = tokio::spawn(async move {
-            if let Err(e) = new_connection.run().await {
-                error!("[SHARD-{}] Hot switchover connection failed: {}", shard_id, e);
+            match new_connection.run().await {
+                Ok(()) => {
+                    debug!("[SHARD-{}] Hot switchover connection task exited normally", shard_id);
+                }
+                Err(e) => {
+                    error!("[SHARD-{}] Hot switchover connection failed: {}", shard_id, e);
+                }
             }
         });
 
@@ -877,6 +883,14 @@ impl<H: WebSocketHandler> ShardManager<H> {
                 debug!("[SHARD-{}] Old connection already closed: {}", shard_id, e);
             }
         }
+
+        // Fix metrics race: old connection's disconnect will set is_connected=false,
+        // but the new connection is already running. Re-set to true after close is sent.
+        // Use a small delay to let the old connection's metrics update complete first.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        self.metrics.update_shard(shard_id, |s| {
+            s.is_connected = true;
+        });
 
         // Replace handle using HashMap lookup
         {

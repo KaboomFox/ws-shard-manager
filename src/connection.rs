@@ -110,6 +110,7 @@ impl<H: WebSocketHandler> Connection<H> {
         command_rx: mpsc::Receiver<ConnectionCommand>,
         ready_tx: oneshot::Sender<()>,
         subscriptions: Vec<H::Subscription>,
+        switchover_tx: mpsc::Sender<usize>,
     ) -> Self {
         Self {
             shard_id,
@@ -121,7 +122,7 @@ impl<H: WebSocketHandler> Connection<H> {
             command_rx,
             ready_tx: Some(ready_tx),
             initial_subscriptions: Some(subscriptions),
-            switchover_tx: None,
+            switchover_tx: Some(switchover_tx),
         }
     }
 
