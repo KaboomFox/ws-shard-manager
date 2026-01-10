@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Default channel buffer size
 const DEFAULT_CHANNEL_SIZE: usize = 100;
@@ -43,6 +43,10 @@ pub struct ShardManager<H: WebSocketHandler> {
     /// Mutex to serialize start/stop operations and prevent race conditions.
     /// This is a tokio::Mutex so it can be held across await points.
     lifecycle_lock: Mutex<()>,
+    /// Channel for connections to request hot switchover
+    switchover_tx: mpsc::Sender<usize>,
+    /// Receiver for switchover requests (wrapped in Mutex for interior mutability)
+    switchover_rx: Mutex<mpsc::Receiver<usize>>,
 }
 
 struct ManagerState<S: Clone + Eq + std::hash::Hash> {
@@ -73,6 +77,8 @@ impl<S: Clone + Eq + std::hash::Hash> Default for ManagerState<S> {
 impl<H: WebSocketHandler> ShardManager<H> {
     /// Create a new shard manager
     pub fn new(config: ShardManagerConfig, handler: H) -> Self {
+        // Channel for connections to request hot switchover (buffer 10 requests)
+        let (switchover_tx, switchover_rx) = mpsc::channel(10);
         Self {
             handler: Arc::new(handler),
             config,
@@ -81,12 +87,19 @@ impl<H: WebSocketHandler> ShardManager<H> {
             shard_handles: RwLock::new(HashMap::new()),
             next_shard_id: AtomicUsize::new(0),
             lifecycle_lock: Mutex::new(()),
+            switchover_tx,
+            switchover_rx: Mutex::new(switchover_rx),
         }
     }
 
     /// Get the metrics for this manager
     pub fn metrics(&self) -> Arc<Metrics> {
         self.metrics.clone()
+    }
+
+    /// Get a reference to the handler
+    pub fn handler(&self) -> &Arc<H> {
+        &self.handler
     }
 
     /// Check if the manager is currently running
@@ -202,6 +215,28 @@ impl<H: WebSocketHandler> ShardManager<H> {
         Ok(())
     }
 
+    /// Process pending hot switchover requests from connections.
+    ///
+    /// Call this periodically (e.g., in a background task) to handle
+    /// data timeout triggered switchovers. Returns the number of
+    /// switchovers initiated.
+    pub async fn process_switchover_requests(&self) -> usize {
+        let mut count = 0;
+        let mut rx = self.switchover_rx.lock().await;
+
+        // Process all pending requests
+        while let Ok(shard_id) = rx.try_recv() {
+            info!("[SHARD-{}] Processing hot switchover request", shard_id);
+            if let Err(e) = self.hot_switchover(shard_id).await {
+                warn!("[SHARD-{}] Hot switchover failed: {}", shard_id, e);
+            } else {
+                count += 1;
+            }
+        }
+
+        count
+    }
+
     /// Stop all shards gracefully
     ///
     /// This will close all connections and wait for tasks to complete.
@@ -287,6 +322,7 @@ impl<H: WebSocketHandler> ShardManager<H> {
 
             // Check if already subscribed
             if let Some(&shard_id) = state.subscription_to_shard.get(&item) {
+                trace!("[SHARD-{}] Subscription already exists, skipping", shard_id);
                 return SubscribeResult::AlreadySubscribed { shard_id };
             }
 
@@ -332,6 +368,7 @@ impl<H: WebSocketHandler> ShardManager<H> {
                         (tx, sub_count)
                     };
                     state.subscription_to_shard.insert(item.clone(), shard_id);
+                    trace!("[SHARD-{}] Added subscription (count: {})", shard_id, add_result.1);
                     Ok((shard_id, add_result.0, add_result.1))
                 }
                 None if self.config.auto_rebalance => {
@@ -397,6 +434,7 @@ impl<H: WebSocketHandler> ShardManager<H> {
                     (tx, count)
                 };
                 state.subscription_to_shard.insert(item.clone(), new_id);
+                trace!("[SHARD-{}] Created new shard, added subscription (count: {})", new_id, add_result.1);
                 (new_id, add_result.0, add_result.1)
             }
         };
@@ -519,6 +557,7 @@ impl<H: WebSocketHandler> ShardManager<H> {
                     for sub in &subs {
                         shard.remove_subscription(sub);
                     }
+                    trace!("[SHARD-{}] Removed {} subscriptions", shard_id, subs.len());
 
                     let tx = shard.command_tx.clone();
                     let count = shard.subscription_count();
@@ -594,10 +633,17 @@ impl<H: WebSocketHandler> ShardManager<H> {
         let shard = metrics.get(shard_id)?;
 
         if !shard.is_connected {
+            trace!("[SHARD-{}] Freshness check: disconnected", shard_id);
             return None;
         }
 
-        shard.time_since_last_message
+        let freshness = shard.time_since_last_message;
+        trace!(
+            "[SHARD-{}] Freshness check: {:?}",
+            shard_id,
+            freshness.map(|d| format!("{}ms", d.as_millis())).unwrap_or_else(|| "no data".to_string())
+        );
+        freshness
     }
 
     /// Check if a subscription's data is considered fresh.
@@ -626,12 +672,26 @@ impl<H: WebSocketHandler> ShardManager<H> {
         max_staleness: Duration,
     ) -> bool {
         let Some(shard_id) = self.subscription_shard(subscription) else {
+            trace!("Freshness check: subscription not found");
             return false;
         };
 
         match self.shard_freshness(shard_id) {
-            Some(since_last_message) => since_last_message <= max_staleness,
-            None => false,
+            Some(since_last_message) => {
+                let is_fresh = since_last_message <= max_staleness;
+                trace!(
+                    "[SHARD-{}] Subscription freshness: {}ms vs max {}ms -> {}",
+                    shard_id,
+                    since_last_message.as_millis(),
+                    max_staleness.as_millis(),
+                    if is_fresh { "FRESH" } else { "STALE" }
+                );
+                is_fresh
+            }
+            None => {
+                trace!("[SHARD-{}] Subscription freshness: no data -> STALE", shard_id);
+                false
+            }
         }
     }
 
@@ -855,6 +915,7 @@ impl<H: WebSocketHandler> ShardManager<H> {
         let backoff_config = self.config.backoff.clone();
         let health_config = self.config.health.clone();
         let metrics = self.metrics.clone();
+        let switchover_tx = self.switchover_tx.clone();
 
         let handle = tokio::spawn(async move {
             Self::run_connection_with_recovery(
@@ -865,6 +926,7 @@ impl<H: WebSocketHandler> ShardManager<H> {
                 health_config,
                 metrics,
                 rx,
+                switchover_tx,
             )
             .await
         });
@@ -899,11 +961,12 @@ impl<H: WebSocketHandler> ShardManager<H> {
         health_config: crate::config::HealthConfig,
         metrics: Arc<Metrics>,
         command_rx: mpsc::Receiver<ConnectionCommand>,
+        switchover_tx: mpsc::Sender<usize>,
     ) {
         // Note: We can't easily restart the connection after channel closure,
         // so we just catch panics within this task and log them.
         // For full recovery, the manager would need to recreate the channel.
-        let connection = Connection::new(
+        let connection = Connection::with_switchover_channel(
             shard_id,
             handler,
             connection_config,
@@ -911,6 +974,7 @@ impl<H: WebSocketHandler> ShardManager<H> {
             health_config,
             metrics.clone(),
             command_rx,
+            switchover_tx,
         );
 
         match AssertUnwindSafe(connection.run())

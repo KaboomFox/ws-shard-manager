@@ -2,6 +2,7 @@ use crate::connection::ConnectionCommand;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use tokio::sync::mpsc;
+use tracing::trace;
 
 /// Represents a single shard's state
 #[derive(Debug)]
@@ -44,15 +45,29 @@ impl<S: Clone + Eq + Hash> Shard<S> {
     /// Add a subscription
     pub fn add_subscription(&mut self, sub: S) -> bool {
         if self.has_capacity() {
-            self.subscriptions.insert(sub)
+            let added = self.subscriptions.insert(sub);
+            trace!(
+                "[SHARD-{}] add_subscription: added={}, count={}/{}",
+                self.id, added, self.subscriptions.len(), self.max_subscriptions
+            );
+            added
         } else {
+            trace!(
+                "[SHARD-{}] add_subscription: at capacity ({}/{})",
+                self.id, self.subscriptions.len(), self.max_subscriptions
+            );
             false
         }
     }
 
     /// Remove a subscription
     pub fn remove_subscription(&mut self, sub: &S) -> bool {
-        self.subscriptions.remove(sub)
+        let removed = self.subscriptions.remove(sub);
+        trace!(
+            "[SHARD-{}] remove_subscription: removed={}, count={}/{}",
+            self.id, removed, self.subscriptions.len(), self.max_subscriptions
+        );
+        removed
     }
 }
 

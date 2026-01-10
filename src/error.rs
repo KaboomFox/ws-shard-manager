@@ -95,3 +95,20 @@ pub enum SubscribeResult {
     /// Failed to subscribe
     Failed { error: String },
 }
+
+impl SubscribeResult {
+    /// Returns true if the subscription was successful or already existed
+    pub fn is_success(&self) -> bool {
+        matches!(self, SubscribeResult::Success { .. } | SubscribeResult::AlreadySubscribed { .. })
+    }
+
+    /// Returns the shard_id if available
+    pub fn shard_id(&self) -> Option<usize> {
+        match self {
+            SubscribeResult::Success { shard_id }
+            | SubscribeResult::AlreadySubscribed { shard_id }
+            | SubscribeResult::SendFailed { shard_id, .. } => Some(*shard_id),
+            SubscribeResult::Failed { .. } => None,
+        }
+    }
+}

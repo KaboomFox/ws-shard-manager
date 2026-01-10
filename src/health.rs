@@ -98,6 +98,11 @@ impl HealthMonitor {
         }
     }
 
+    /// Reset data timeout timer (used when hot switchover is requested)
+    pub fn reset_data_timeout(&mut self) {
+        self.last_data_received = Some(Instant::now());
+    }
+
     /// Check if the connection is unhealthy based on consecutive failures
     pub fn is_unhealthy(&self) -> bool {
         self.consecutive_ping_failures >= self.config.failure_threshold

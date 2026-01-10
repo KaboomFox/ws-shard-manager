@@ -15,7 +15,7 @@ use tokio_tungstenite::{
     client_async_tls_with_config, tungstenite::client::IntoClientRequest, tungstenite::Message,
     Connector, MaybeTlsStream, WebSocketStream,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use url::Url;
 
 /// Commands that can be sent to a connection
@@ -42,10 +42,13 @@ pub struct Connection<H: WebSocketHandler> {
     ready_tx: Option<oneshot::Sender<()>>,
     /// Explicit subscriptions for this shard (used during hot switchover)
     initial_subscriptions: Option<Vec<H::Subscription>>,
+    /// Optional channel to request hot switchover from manager
+    switchover_tx: Option<mpsc::Sender<usize>>,
 }
 
 impl<H: WebSocketHandler> Connection<H> {
-    /// Create a new connection manager
+    /// Create a new connection manager (used for hot switchover connections)
+    #[allow(dead_code)]
     pub fn new(
         shard_id: usize,
         handler: Arc<H>,
@@ -65,6 +68,33 @@ impl<H: WebSocketHandler> Connection<H> {
             command_rx,
             ready_tx: None,
             initial_subscriptions: None,
+            switchover_tx: None,
+        }
+    }
+
+    /// Create a new connection with a switchover request channel
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_switchover_channel(
+        shard_id: usize,
+        handler: Arc<H>,
+        config: ConnectionConfig,
+        backoff: BackoffConfig,
+        health_config: HealthConfig,
+        metrics: Arc<Metrics>,
+        command_rx: mpsc::Receiver<ConnectionCommand>,
+        switchover_tx: mpsc::Sender<usize>,
+    ) -> Self {
+        Self {
+            shard_id,
+            handler,
+            config,
+            backoff,
+            health_config,
+            metrics,
+            command_rx,
+            ready_tx: None,
+            initial_subscriptions: None,
+            switchover_tx: Some(switchover_tx),
         }
     }
 
@@ -91,6 +121,7 @@ impl<H: WebSocketHandler> Connection<H> {
             command_rx,
             ready_tx: Some(ready_tx),
             initial_subscriptions: Some(subscriptions),
+            switchover_tx: None,
         }
     }
 
@@ -235,9 +266,11 @@ impl<H: WebSocketHandler> Connection<H> {
     /// Otherwise, handlers are spawned in a separate task for panic isolation.
     #[inline]
     async fn call_on_message(&self, message: Message, state: &ConnectionState) {
+        let start = Instant::now();
         if self.config.low_latency_mode {
             // Direct call - no spawn overhead (~1-5µs savings per message)
             self.handler.on_message(message, state).await;
+            trace!("[SHARD-{}] Handler processed message in {:?}", self.shard_id, start.elapsed());
         } else {
             // Spawn for panic protection
             let handler = self.handler.clone();
@@ -245,8 +278,10 @@ impl<H: WebSocketHandler> Connection<H> {
             let shard_id = self.shard_id;
 
             let result = tokio::task::spawn(async move {
+                let start = Instant::now();
                 let fut = AssertUnwindSafe(handler.on_message(message, &state_clone));
-                fut.await
+                fut.await;
+                trace!("[SHARD-{}] Handler processed message in {:?}", shard_id, start.elapsed());
             })
             .await;
 
@@ -365,9 +400,9 @@ impl<H: WebSocketHandler> Connection<H> {
                 msg = read.next() => {
                     match msg {
                         Some(Ok(message)) => {
-                            health.record_data_received();
                             self.metrics.record_message_received();
                             self.metrics.record_shard_message_received(self.shard_id);
+                            trace!("[SHARD-{}] Received message: {} bytes", self.shard_id, message.len());
 
                             match &message {
                                 Message::Ping(data) => {
@@ -384,6 +419,10 @@ impl<H: WebSocketHandler> Connection<H> {
                                     break;
                                 }
                                 _ => {
+                                    // Only count actual data messages for data timeout
+                                    // (not ping/pong which keep connection alive but don't indicate data flow)
+                                    health.record_data_received();
+
                                     // Check for application-level heartbeat
                                     if self.handler.is_heartbeat(&message) {
                                         debug!("[SHARD-{}] Received application heartbeat", self.shard_id);
@@ -452,8 +491,22 @@ impl<H: WebSocketHandler> Connection<H> {
 
                     // Check data timeout
                     if health.is_data_timeout() {
-                        warn!("[SHARD-{}] Data timeout, reconnecting", self.shard_id);
                         self.metrics.record_health_failure();
+
+                        // Request hot switchover if channel available, otherwise regular reconnect
+                        if let Some(ref tx) = self.switchover_tx {
+                            warn!("[SHARD-{}] Data timeout, requesting hot switchover", self.shard_id);
+                            // Non-blocking send - if manager is busy, fall back to regular reconnect
+                            if tx.try_send(self.shard_id).is_ok() {
+                                // Continue running while manager performs switchover
+                                // The manager will close this connection when new one is ready
+                                health.reset_data_timeout();
+                                continue;
+                            }
+                            warn!("[SHARD-{}] Hot switchover channel full, falling back to reconnect", self.shard_id);
+                        } else {
+                            warn!("[SHARD-{}] Data timeout, reconnecting", self.shard_id);
+                        }
                         break;
                     }
 
