@@ -490,9 +490,8 @@ impl<H: WebSocketHandler> Connection<H> {
                         }
                     }
 
-                    // Check data timeout (skip for shards with few subscriptions - they may have low-activity tokens)
-                    // Shards with < 50 subscriptions are exempt since inactive markets may not send data
-                    if health.is_data_timeout() && state.subscription_count >= 50 {
+                    // Check data timeout
+                    if health.is_data_timeout() {
                         self.metrics.record_health_failure();
 
                         // Request hot switchover if channel available, otherwise regular reconnect
