@@ -1,4 +1,5 @@
 use crate::shard::ShardSelectionStrategy;
+use std::net::IpAddr;
 use std::time::Duration;
 
 /// Configuration for the shard manager
@@ -127,6 +128,34 @@ impl ShardManagerConfigBuilder {
             ));
         }
 
+        if self.config.connection.connect_timeout.is_zero() {
+            return Err(ConfigError::InvalidConnection(
+                "connect_timeout must be > 0".to_string(),
+            ));
+        }
+
+        if self.config.connection.max_connect_attempts == 0 {
+            return Err(ConfigError::InvalidConnection(
+                "max_connect_attempts must be > 0".to_string(),
+            ));
+        }
+
+        // Validate source IP configuration
+        if !self.config.connection.source_ips.is_empty() {
+            if self.config.connection.shards_per_ip == 0 {
+                return Err(ConfigError::InvalidConnection(
+                    "shards_per_ip must be > 0 when source_ips is configured".to_string(),
+                ));
+            }
+
+            // Validate each source IP is a valid IP address
+            for ip_str in &self.config.connection.source_ips {
+                if ip_str.parse::<IpAddr>().is_err() {
+                    return Err(ConfigError::InvalidIpAddress(ip_str.clone()));
+                }
+            }
+        }
+
         // Validate max subscriptions
         if let Some(0) = self.config.max_subscriptions_per_shard {
             return Err(ConfigError::InvalidSubscriptionLimit(
@@ -153,6 +182,9 @@ pub enum ConfigError {
     /// Invalid subscription limit
     #[error("Invalid subscription limit: {0}")]
     InvalidSubscriptionLimit(String),
+    /// Invalid IP address format
+    #[error("Invalid IP address format: {0}")]
+    InvalidIpAddress(String),
 }
 
 /// Connection-related configuration
@@ -172,6 +204,18 @@ pub struct ConnectionConfig {
     /// When enabled, handler panics will crash the connection task.
     /// Enable this for trading bots where microseconds matter.
     pub low_latency_mode: bool,
+    /// Optional source IPs to bind outgoing connections.
+    /// Shards are distributed across IPs in round-robin blocks.
+    /// If empty, system default routing is used.
+    pub source_ips: Vec<String>,
+    /// Number of shards per source IP before rotating to next IP.
+    /// Only used when source_ips is non-empty.
+    /// Default: 10 shards per IP.
+    pub shards_per_ip: usize,
+    /// Optional proxy URL for WebSocket connections.
+    /// Supports SOCKS5 (socks5://host:port) and HTTP CONNECT (http://host:port).
+    /// Can include authentication: socks5://user:pass@host:port
+    pub proxy: Option<String>,
 }
 
 impl Default for ConnectionConfig {
@@ -183,7 +227,22 @@ impl Default for ConnectionConfig {
             circuit_breaker_threshold: 5, // Trip after 5 consecutive failures
             circuit_breaker_reset_timeout: Duration::from_secs(60), // Wait 60s before retry
             low_latency_mode: false, // Safe by default
+            source_ips: Vec::new(), // Empty = use system default routing
+            shards_per_ip: 10, // Default: 10 shards per IP
+            proxy: None, // No proxy by default
         }
+    }
+}
+
+impl ConnectionConfig {
+    /// Get the source IP for a given shard ID.
+    /// Returns None if no source IPs are configured.
+    pub fn source_ip_for_shard(&self, shard_id: usize) -> Option<&str> {
+        if self.source_ips.is_empty() {
+            return None;
+        }
+        let ip_index = shard_id / self.shards_per_ip;
+        self.source_ips.get(ip_index % self.source_ips.len()).map(|s| s.as_str())
     }
 }
 
@@ -313,5 +372,122 @@ mod tests {
             .build();
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_config_builder_rejects_zero_connect_timeout() {
+        let result = ShardManagerConfig::builder()
+            .connection(ConnectionConfig {
+                connect_timeout: Duration::ZERO,
+                ..Default::default()
+            })
+            .build();
+
+        assert!(result.is_err());
+        assert!(matches!(result, Err(ConfigError::InvalidConnection(_))));
+    }
+
+    #[test]
+    fn test_config_builder_rejects_zero_max_connect_attempts() {
+        let result = ShardManagerConfig::builder()
+            .connection(ConnectionConfig {
+                max_connect_attempts: 0,
+                ..Default::default()
+            })
+            .build();
+
+        assert!(result.is_err());
+        assert!(matches!(result, Err(ConfigError::InvalidConnection(_))));
+    }
+
+    #[test]
+    fn test_config_builder_rejects_zero_shards_per_ip_with_source_ips() {
+        let result = ShardManagerConfig::builder()
+            .connection(ConnectionConfig {
+                source_ips: vec!["192.168.1.1".to_string()],
+                shards_per_ip: 0,
+                ..Default::default()
+            })
+            .build();
+
+        assert!(result.is_err());
+        assert!(matches!(result, Err(ConfigError::InvalidConnection(_))));
+    }
+
+    #[test]
+    fn test_config_builder_accepts_zero_shards_per_ip_without_source_ips() {
+        // shards_per_ip = 0 is allowed when source_ips is empty
+        let result = ShardManagerConfig::builder()
+            .connection(ConnectionConfig {
+                source_ips: vec![],
+                shards_per_ip: 0,
+                ..Default::default()
+            })
+            .build();
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_config_builder_rejects_invalid_ip_address() {
+        let result = ShardManagerConfig::builder()
+            .connection(ConnectionConfig {
+                source_ips: vec!["not-an-ip".to_string()],
+                ..Default::default()
+            })
+            .build();
+
+        assert!(result.is_err());
+        assert!(matches!(result, Err(ConfigError::InvalidIpAddress(ref s)) if s == "not-an-ip"));
+    }
+
+    #[test]
+    fn test_config_builder_accepts_valid_ipv4_addresses() {
+        let result = ShardManagerConfig::builder()
+            .connection(ConnectionConfig {
+                source_ips: vec![
+                    "192.168.1.1".to_string(),
+                    "10.0.0.1".to_string(),
+                    "172.16.0.1".to_string(),
+                ],
+                ..Default::default()
+            })
+            .build();
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_config_builder_accepts_valid_ipv6_addresses() {
+        let result = ShardManagerConfig::builder()
+            .connection(ConnectionConfig {
+                source_ips: vec![
+                    "::1".to_string(),
+                    "2001:db8::1".to_string(),
+                    "fe80::1".to_string(),
+                ],
+                ..Default::default()
+            })
+            .build();
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_config_builder_rejects_partial_invalid_ips() {
+        // If any IP is invalid, the whole config should be rejected
+        let result = ShardManagerConfig::builder()
+            .connection(ConnectionConfig {
+                source_ips: vec![
+                    "192.168.1.1".to_string(),
+                    "invalid-ip".to_string(),
+                    "10.0.0.1".to_string(),
+                ],
+                ..Default::default()
+            })
+            .build();
+
+        assert!(result.is_err());
+        assert!(matches!(result, Err(ConfigError::InvalidIpAddress(ref s)) if s == "invalid-ip"));
     }
 }

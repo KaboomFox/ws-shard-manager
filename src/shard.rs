@@ -1,5 +1,5 @@
 use crate::connection::ConnectionCommand;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use tokio::sync::mpsc;
 
@@ -72,8 +72,11 @@ pub enum ShardSelectionStrategy {
 ///
 /// This is useful during hot switchover to prevent new subscriptions from going
 /// to shards that are in the middle of a connection swap.
+///
+/// Note: This function now accepts a HashMap to properly handle shard ID/index mismatch
+/// that can occur after stop/restart cycles.
 pub fn select_shard_excluding<S: Clone + Eq + Hash>(
-    shards: &[Shard<S>],
+    shards: &HashMap<usize, Shard<S>>,
     excluded: &HashSet<usize>,
     strategy: ShardSelectionStrategy,
     last_used: &mut usize,
@@ -81,27 +84,49 @@ pub fn select_shard_excluding<S: Clone + Eq + Hash>(
     match strategy {
         ShardSelectionStrategy::LeastLoaded => {
             shards
-                .iter()
+                .values()
                 .filter(|s| s.has_capacity() && !excluded.contains(&s.id))
                 .min_by_key(|s| s.subscription_count())
                 .map(|s| s.id)
         }
         ShardSelectionStrategy::RoundRobin => {
-            let start = *last_used;
-            for i in 0..shards.len() {
-                let idx = (start + i + 1) % shards.len();
-                if shards[idx].has_capacity() && !excluded.contains(&idx) {
-                    *last_used = idx;
-                    return Some(idx);
+            // For RoundRobin with HashMap, we need to iterate through sorted keys
+            // to maintain deterministic ordering
+            let mut shard_ids: Vec<usize> = shards.keys().copied().collect();
+            shard_ids.sort_unstable();
+
+            if shard_ids.is_empty() {
+                return None;
+            }
+
+            // Find the starting position based on last_used
+            let start_pos = shard_ids.iter().position(|&id| id > *last_used).unwrap_or(0);
+
+            for i in 0..shard_ids.len() {
+                let idx = (start_pos + i) % shard_ids.len();
+                let shard_id = shard_ids[idx];
+                if let Some(shard) = shards.get(&shard_id) {
+                    if shard.has_capacity() && !excluded.contains(&shard_id) {
+                        *last_used = shard_id;
+                        return Some(shard_id);
+                    }
                 }
             }
             None
         }
         ShardSelectionStrategy::Sequential => {
-            shards
-                .iter()
-                .find(|s| s.has_capacity() && !excluded.contains(&s.id))
-                .map(|s| s.id)
+            // For Sequential, use sorted keys to maintain deterministic ordering
+            let mut shard_ids: Vec<usize> = shards.keys().copied().collect();
+            shard_ids.sort_unstable();
+
+            for shard_id in shard_ids {
+                if let Some(shard) = shards.get(&shard_id) {
+                    if shard.has_capacity() && !excluded.contains(&shard_id) {
+                        return Some(shard_id);
+                    }
+                }
+            }
+            None
         }
     }
 }
@@ -110,11 +135,11 @@ pub fn select_shard_excluding<S: Clone + Eq + Hash>(
 mod tests {
     use super::*;
 
-    fn create_test_shards(count: usize, max_subs: usize) -> Vec<Shard<String>> {
+    fn create_test_shards(count: usize, max_subs: usize) -> HashMap<usize, Shard<String>> {
         (0..count)
             .map(|id| {
                 let (tx, _rx) = mpsc::channel(1);
-                Shard::new(id, tx, max_subs)
+                (id, Shard::new(id, tx, max_subs))
             })
             .collect()
     }
@@ -142,13 +167,13 @@ mod tests {
 
         // Add different amounts to each shard
         for i in 0..30 {
-            shards[0].add_subscription(format!("s0-{}", i));
+            shards.get_mut(&0).unwrap().add_subscription(format!("s0-{}", i));
         }
         for i in 0..10 {
-            shards[1].add_subscription(format!("s1-{}", i));
+            shards.get_mut(&1).unwrap().add_subscription(format!("s1-{}", i));
         }
         for i in 0..50 {
-            shards[2].add_subscription(format!("s2-{}", i));
+            shards.get_mut(&2).unwrap().add_subscription(format!("s2-{}", i));
         }
 
         let mut last = 0;
@@ -185,8 +210,8 @@ mod tests {
         let mut last = 0;
 
         // Fill first shard
-        shards[0].add_subscription("a".to_string());
-        shards[0].add_subscription("b".to_string());
+        shards.get_mut(&0).unwrap().add_subscription("a".to_string());
+        shards.get_mut(&0).unwrap().add_subscription("b".to_string());
 
         // Should now select second shard
         assert_eq!(
@@ -200,8 +225,8 @@ mod tests {
         let mut shards = create_test_shards(2, 1);
         let excluded = HashSet::new();
 
-        shards[0].add_subscription("a".to_string());
-        shards[1].add_subscription("b".to_string());
+        shards.get_mut(&0).unwrap().add_subscription("a".to_string());
+        shards.get_mut(&1).unwrap().add_subscription("b".to_string());
 
         let mut last = 0;
         assert_eq!(
@@ -223,5 +248,46 @@ mod tests {
         // Should select shard 0 or 2, not 1
         assert!(selected == Some(0) || selected == Some(2));
         assert_ne!(selected, Some(1));
+    }
+
+    #[test]
+    fn test_non_contiguous_shard_ids() {
+        // Test that HashMap-based selection works with non-contiguous shard IDs
+        // (which can happen after stop/restart cycles)
+        let mut shards: HashMap<usize, Shard<String>> = HashMap::new();
+
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+        let (tx3, _rx3) = mpsc::channel(1);
+
+        // Simulate shards with IDs 5, 10, 15 (non-contiguous)
+        shards.insert(5, Shard::new(5, tx1, 100));
+        shards.insert(10, Shard::new(10, tx2, 100));
+        shards.insert(15, Shard::new(15, tx3, 100));
+
+        let excluded = HashSet::new();
+        let mut last = 0;
+
+        // Should work correctly with non-contiguous IDs
+        let selected = select_shard_excluding(&shards, &excluded, ShardSelectionStrategy::Sequential, &mut last);
+        assert_eq!(selected, Some(5)); // First available by sorted order
+
+        // LeastLoaded should also work
+        let selected = select_shard_excluding(&shards, &excluded, ShardSelectionStrategy::LeastLoaded, &mut last);
+        assert!(selected.is_some());
+
+        // RoundRobin should cycle through
+        let mut last = 0;
+        let first = select_shard_excluding(&shards, &excluded, ShardSelectionStrategy::RoundRobin, &mut last);
+        let second = select_shard_excluding(&shards, &excluded, ShardSelectionStrategy::RoundRobin, &mut last);
+        let third = select_shard_excluding(&shards, &excluded, ShardSelectionStrategy::RoundRobin, &mut last);
+
+        assert!(first.is_some());
+        assert!(second.is_some());
+        assert!(third.is_some());
+        // All three should be different
+        assert_ne!(first, second);
+        assert_ne!(second, third);
+        assert_ne!(first, third);
     }
 }

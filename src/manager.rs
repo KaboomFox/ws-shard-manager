@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -36,13 +36,18 @@ pub struct ShardManager<H: WebSocketHandler> {
     config: ShardManagerConfig,
     metrics: Arc<Metrics>,
     state: Arc<RwLock<ManagerState<H::Subscription>>>,
-    shard_handles: RwLock<Vec<JoinHandle<()>>>,
+    /// Shard task handles indexed by shard ID (not position) to handle ID/index mismatch
+    shard_handles: RwLock<HashMap<usize, JoinHandle<()>>>,
     /// Monotonically increasing counter for shard IDs to prevent race conditions
     next_shard_id: AtomicUsize,
+    /// Mutex to serialize start/stop operations and prevent race conditions.
+    /// This is a tokio::Mutex so it can be held across await points.
+    lifecycle_lock: Mutex<()>,
 }
 
 struct ManagerState<S: Clone + Eq + std::hash::Hash> {
-    shards: Vec<Shard<S>>,
+    /// Shards indexed by their ID (not by position) to handle ID/index mismatch after stop/restart
+    shards: HashMap<usize, Shard<S>>,
     subscription_to_shard: HashMap<S, usize>,
     last_shard_used: usize,
     is_running: bool,
@@ -55,7 +60,7 @@ struct ManagerState<S: Clone + Eq + std::hash::Hash> {
 impl<S: Clone + Eq + std::hash::Hash> Default for ManagerState<S> {
     fn default() -> Self {
         Self {
-            shards: Vec::new(),
+            shards: HashMap::new(),
             subscription_to_shard: HashMap::new(),
             last_shard_used: 0,
             is_running: false,
@@ -73,8 +78,9 @@ impl<H: WebSocketHandler> ShardManager<H> {
             config,
             metrics: Arc::new(Metrics::new()),
             state: Arc::new(RwLock::new(ManagerState::default())),
-            shard_handles: RwLock::new(Vec::new()),
+            shard_handles: RwLock::new(HashMap::new()),
             next_shard_id: AtomicUsize::new(0),
+            lifecycle_lock: Mutex::new(()),
         }
     }
 
@@ -99,7 +105,12 @@ impl<H: WebSocketHandler> ShardManager<H> {
     /// Returns an error if the manager is already running or if configuration
     /// is invalid.
     pub async fn start(&self) -> Result<(), Error> {
-        // Check if already running
+        // Acquire lifecycle lock to serialize start/stop operations.
+        // This prevents race conditions where concurrent start() calls could
+        // both pass the is_running check before either sets is_running = true.
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
+
+        // Check if already running (now safe under lifecycle lock)
         {
             let state = self.state.read();
             if state.is_running {
@@ -134,31 +145,34 @@ impl<H: WebSocketHandler> ShardManager<H> {
         );
 
         // Create shards using atomic counter for IDs
+        // Collect the shard IDs we create for distributing subscriptions
+        let mut created_shard_ids = Vec::with_capacity(shard_count);
         for _ in 0..shard_count {
             let shard_id = self.next_shard_id.fetch_add(1, Ordering::SeqCst);
             self.create_shard(shard_id).await?;
+            created_shard_ids.push(shard_id);
         }
 
         // Distribute initial subscriptions to shard state
-        let mut shard_subscriptions: Vec<Vec<H::Subscription>> = vec![Vec::new(); shard_count];
+        let mut shard_subscriptions: HashMap<usize, Vec<H::Subscription>> = HashMap::new();
         for (i, sub) in subscriptions.into_iter().enumerate() {
-            let shard_id = i % shard_count;
-            shard_subscriptions[shard_id].push(sub.clone());
+            let shard_id = created_shard_ids[i % shard_count];
+            shard_subscriptions.entry(shard_id).or_default().push(sub.clone());
             let mut state = self.state.write();
-            if let Some(shard) = state.shards.get_mut(shard_id) {
+            if let Some(shard) = state.shards.get_mut(&shard_id) {
                 shard.subscriptions.insert(sub.clone());
             }
             state.subscription_to_shard.insert(sub, shard_id);
         }
 
         // Send subscription messages to each shard
-        for (shard_id, subs) in shard_subscriptions.into_iter().enumerate() {
+        for (shard_id, subs) in shard_subscriptions {
             if subs.is_empty() {
                 continue;
             }
             let command_tx = {
                 let state = self.state.read();
-                state.shards.get(shard_id).map(|s| s.command_tx.clone())
+                state.shards.get(&shard_id).map(|s| s.command_tx.clone())
             };
             if let Some(tx) = command_tx {
                 if let Some(msg) = self.handler.subscription_message(&subs) {
@@ -179,8 +193,8 @@ impl<H: WebSocketHandler> ShardManager<H> {
 
         // Update metrics
         let state = self.state.read();
-        for shard in &state.shards {
-            self.metrics.update_shard(shard.id, |s| {
+        for (shard_id, shard) in &state.shards {
+            self.metrics.update_shard(*shard_id, |s| {
                 s.subscription_count = shard.subscription_count();
             });
         }
@@ -193,13 +207,17 @@ impl<H: WebSocketHandler> ShardManager<H> {
     /// This will close all connections and wait for tasks to complete.
     /// After stopping, the manager can be restarted with `start()`.
     pub async fn stop(&self) -> Result<(), Error> {
+        // Acquire lifecycle lock to serialize start/stop operations.
+        // This prevents race conditions between concurrent start/stop calls.
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
+
         info!("Stopping ShardManager");
 
         // Collect command channels while holding lock briefly
         let channels: Vec<_> = {
             let mut state = self.state.write();
             state.is_running = false;
-            state.shards.iter().map(|s| s.command_tx.clone()).collect()
+            state.shards.values().map(|s| s.command_tx.clone()).collect()
         };
 
         // Send close commands outside the lock
@@ -210,12 +228,12 @@ impl<H: WebSocketHandler> ShardManager<H> {
         }
 
         // Wait for all shard tasks to complete
-        let handles: Vec<_> = {
+        let handles: HashMap<usize, JoinHandle<()>> = {
             let mut handles = self.shard_handles.write();
             std::mem::take(&mut *handles)
         };
 
-        for handle in handles {
+        for (_shard_id, handle) in handles {
             let _ = handle.await;
         }
 
@@ -285,23 +303,36 @@ impl<H: WebSocketHandler> ShardManager<H> {
             match existing {
                 Some(shard_id) => {
                     // Add subscription atomically in the same lock
-                    if !state.shards[shard_id].add_subscription(item.clone()) {
-                        error!(
-                            "[SHARD-{}] Failed to add subscription - shard unexpectedly at capacity",
-                            shard_id
-                        );
-                        return SubscribeResult::Failed {
-                            error: format!(
-                                "Subscription limit exceeded: {}/{}",
-                                state.subscription_to_shard.len(),
-                                state.shards.len() * max_per_shard
-                            ),
+                    // Use a scope to limit the mutable borrow of state.shards
+                    let add_result = {
+                        let shard = match state.shards.get_mut(&shard_id) {
+                            Some(s) => s,
+                            None => {
+                                error!("[SHARD-{}] Shard not found in HashMap", shard_id);
+                                return SubscribeResult::Failed {
+                                    error: format!("Shard {} not found", shard_id),
+                                };
+                            }
                         };
-                    }
+                        if !shard.add_subscription(item.clone()) {
+                            error!(
+                                "[SHARD-{}] Failed to add subscription - shard unexpectedly at capacity",
+                                shard_id
+                            );
+                            return SubscribeResult::Failed {
+                                error: format!(
+                                    "Subscription limit exceeded: {}/{}",
+                                    state.subscription_to_shard.len(),
+                                    state.shards.len() * max_per_shard
+                                ),
+                            };
+                        }
+                        let tx = shard.command_tx.clone();
+                        let sub_count = shard.subscription_count();
+                        (tx, sub_count)
+                    };
                     state.subscription_to_shard.insert(item.clone(), shard_id);
-                    let tx = state.shards[shard_id].command_tx.clone();
-                    let sub_count = state.shards[shard_id].subscription_count();
-                    Ok((shard_id, tx, sub_count))
+                    Ok((shard_id, add_result.0, add_result.1))
                 }
                 None if self.config.auto_rebalance => {
                     // Need to create new shard - use atomic counter for thread-safe ID assignment
@@ -344,16 +375,29 @@ impl<H: WebSocketHandler> ShardManager<H> {
                 }
 
                 // New shard should always have capacity
-                if !state.shards[new_id].add_subscription(item.clone()) {
-                    error!("[SHARD-{}] New shard unexpectedly at capacity", new_id);
-                    return SubscribeResult::Failed {
-                        error: "New shard unexpectedly at capacity".to_string(),
+                // Use a scope to limit the mutable borrow of state.shards
+                let add_result = {
+                    let shard = match state.shards.get_mut(&new_id) {
+                        Some(s) => s,
+                        None => {
+                            error!("[SHARD-{}] Newly created shard not found in HashMap", new_id);
+                            return SubscribeResult::Failed {
+                                error: format!("Newly created shard {} not found", new_id),
+                            };
+                        }
                     };
-                }
+                    if !shard.add_subscription(item.clone()) {
+                        error!("[SHARD-{}] New shard unexpectedly at capacity", new_id);
+                        return SubscribeResult::Failed {
+                            error: "New shard unexpectedly at capacity".to_string(),
+                        };
+                    }
+                    let tx = shard.command_tx.clone();
+                    let count = shard.subscription_count();
+                    (tx, count)
+                };
                 state.subscription_to_shard.insert(item.clone(), new_id);
-                let tx = state.shards[new_id].command_tx.clone();
-                let count = state.shards[new_id].subscription_count();
-                (new_id, tx, count)
+                (new_id, add_result.0, add_result.1)
             }
         };
 
@@ -373,7 +417,7 @@ impl<H: WebSocketHandler> ShardManager<H> {
                 // Rollback: remove subscription from state so retry is possible
                 {
                     let mut state = self.state.write();
-                    if let Some(shard) = state.shards.get_mut(shard_id) {
+                    if let Some(shard) = state.shards.get_mut(&shard_id) {
                         shard.remove_subscription(&item);
                     }
                     state.subscription_to_shard.remove(&item);
@@ -382,7 +426,7 @@ impl<H: WebSocketHandler> ShardManager<H> {
                 // Update metrics to reflect rollback
                 let new_count = {
                     let state = self.state.read();
-                    state.shards.get(shard_id).map(|s| s.subscription_count()).unwrap_or(0)
+                    state.shards.get(&shard_id).map(|s| s.subscription_count()).unwrap_or(0)
                 };
                 self.metrics.update_shard(shard_id, |s| s.subscription_count = new_count);
 
@@ -456,25 +500,37 @@ impl<H: WebSocketHandler> ShardManager<H> {
 
             let mut result = Vec::new();
             for (shard_id, subs) in by_shard {
-                // Validate shard exists
-                if shard_id >= state.shards.len() {
-                    warn!("[SHARD-{}] Shard no longer exists during unsubscribe", shard_id);
-                    // Clean up orphaned subscriptions from the map
-                    for sub in &subs {
-                        state.subscription_to_shard.remove(sub);
-                    }
-                    continue;
-                }
+                // Validate shard exists using HashMap lookup
+                // Use a scope to limit the mutable borrow of state.shards
+                let shard_result = {
+                    let shard = match state.shards.get_mut(&shard_id) {
+                        Some(s) => s,
+                        None => {
+                            warn!("[SHARD-{}] Shard no longer exists during unsubscribe", shard_id);
+                            // Clean up orphaned subscriptions from the map
+                            for sub in &subs {
+                                state.subscription_to_shard.remove(sub);
+                            }
+                            continue;
+                        }
+                    };
 
-                // Remove subscriptions atomically
+                    // Remove subscriptions from shard
+                    for sub in &subs {
+                        shard.remove_subscription(sub);
+                    }
+
+                    let tx = shard.command_tx.clone();
+                    let count = shard.subscription_count();
+                    (tx, count)
+                };
+
+                // Now remove from subscription_to_shard map (outside of shards borrow)
                 for sub in &subs {
-                    state.shards[shard_id].remove_subscription(sub);
                     state.subscription_to_shard.remove(sub);
                 }
 
-                let tx = state.shards[shard_id].command_tx.clone();
-                let count = state.shards[shard_id].subscription_count();
-                result.push((shard_id, subs, tx, count));
+                result.push((shard_id, subs, shard_result.0, shard_result.1));
             }
 
             result
@@ -518,7 +574,7 @@ impl<H: WebSocketHandler> ShardManager<H> {
         let state = self.state.read();
         state
             .shards
-            .get(shard_id)
+            .get(&shard_id)
             .map(|shard| shard.subscriptions.iter().cloned().collect())
     }
 
@@ -529,11 +585,101 @@ impl<H: WebSocketHandler> ShardManager<H> {
         self.state.read().subscription_to_shard.get(subscription).copied()
     }
 
+    /// Get the time since last message for a shard.
+    ///
+    /// Returns `None` if the shard doesn't exist, is disconnected, or has never received data.
+    /// This is a lower-level method; prefer `is_subscription_fresh` for most use cases.
+    pub fn shard_freshness(&self, shard_id: usize) -> Option<Duration> {
+        let metrics = self.metrics.shard_metrics();
+        let shard = metrics.get(shard_id)?;
+
+        if !shard.is_connected {
+            return None;
+        }
+
+        shard.time_since_last_message
+    }
+
+    /// Check if a subscription's data is considered fresh.
+    ///
+    /// Returns `true` if:
+    /// - The subscription exists and is assigned to a shard
+    /// - The shard is currently connected
+    /// - The shard has received data within `max_staleness`
+    ///
+    /// Use this before acting on data from a subscription to avoid stale data
+    /// after WebSocket disconnections or network issues.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::time::Duration;
+    ///
+    /// // Only execute if data is less than 500ms old
+    /// if manager.is_subscription_fresh(&market_id, Duration::from_millis(500)) {
+    ///     execute_trade();
+    /// }
+    /// ```
+    pub fn is_subscription_fresh(
+        &self,
+        subscription: &H::Subscription,
+        max_staleness: Duration,
+    ) -> bool {
+        let Some(shard_id) = self.subscription_shard(subscription) else {
+            return false;
+        };
+
+        match self.shard_freshness(shard_id) {
+            Some(since_last_message) => since_last_message <= max_staleness,
+            None => false,
+        }
+    }
+
+    /// Check if WebSocket connections are healthy for circuit breaker integration.
+    ///
+    /// Returns `(connected_count, total_count, is_healthy)` where:
+    /// - `connected_count`: Number of shards currently connected
+    /// - `total_count`: Total number of shards
+    /// - `is_healthy`: True if at least `min_connected_ratio` of shards are connected
+    ///
+    /// Use this method to integrate with circuit breakers. When `is_healthy` is false,
+    /// trading should be paused until connections recover.
+    ///
+    /// # Arguments
+    ///
+    /// * `min_connected_ratio` - Minimum ratio of connected shards (0.0 to 1.0).
+    ///   Use 0.5 to require at least half connected, 1.0 to require all connected.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Trip circuit breaker if less than 50% of shards are connected
+    /// let (connected, total, healthy) = manager.websocket_health(0.5);
+    /// if !healthy && total > 0 {
+    ///     circuit_breaker.trip(TripReason::WebSocketDisconnected { connected, total });
+    /// }
+    /// ```
+    pub fn websocket_health(&self, min_connected_ratio: f64) -> (usize, usize, bool) {
+        let metrics = self.metrics.shard_metrics();
+        let total = metrics.len();
+
+        if total == 0 {
+            // No shards exist yet (lazy creation) - consider healthy
+            return (0, 0, true);
+        }
+
+        let connected = metrics.iter().filter(|s| s.is_connected).count();
+        let ratio = connected as f64 / total as f64;
+        let is_healthy = ratio >= min_connected_ratio;
+
+        (connected, total, is_healthy)
+    }
+
     /// Force reconnection of a specific shard
     pub async fn reconnect_shard(&self, shard_id: usize) -> Result<(), Error> {
         let command_tx = {
             let state = self.state.read();
-            state.shards.get(shard_id).map(|s| s.command_tx.clone())
+            state.shards.get(&shard_id).map(|s| s.command_tx.clone())
         };
 
         if let Some(tx) = command_tx {
@@ -590,7 +736,7 @@ impl<H: WebSocketHandler> ShardManager<H> {
         // Get current subscriptions for this shard
         let subscriptions: Vec<H::Subscription> = {
             let state = self.state.read();
-            match state.shards.get(shard_id) {
+            match state.shards.get(&shard_id) {
                 Some(shard) => shard.subscriptions.iter().cloned().collect(),
                 None => {
                     warn!("[SHARD-{}] Shard not found for hot switchover", shard_id);
@@ -656,7 +802,7 @@ impl<H: WebSocketHandler> ShardManager<H> {
         // Gracefully close old connection and swap
         let old_tx = {
             let mut state = self.state.write();
-            if let Some(shard) = state.shards.get_mut(shard_id) {
+            if let Some(shard) = state.shards.get_mut(&shard_id) {
                 let old = shard.command_tx.clone();
                 shard.command_tx = new_tx;
                 Some(old)
@@ -672,11 +818,10 @@ impl<H: WebSocketHandler> ShardManager<H> {
             }
         }
 
-        // Replace handle - wait for old handle to complete first to avoid unbounded growth
+        // Replace handle using HashMap lookup
         {
             let mut handles = self.shard_handles.write();
-            if shard_id < handles.len() {
-                let old_handle = std::mem::replace(&mut handles[shard_id], handle);
+            if let Some(old_handle) = handles.insert(shard_id, handle) {
                 // Wait for old handle in background but with proper cleanup
                 tokio::spawn(async move {
                     match tokio::time::timeout(Duration::from_secs(5), old_handle).await {
@@ -724,16 +869,16 @@ impl<H: WebSocketHandler> ShardManager<H> {
             .await
         });
 
-        // Add shard to state
+        // Add shard to state using HashMap insert
         {
             let mut state = self.state.write();
-            state.shards.push(Shard::new(shard_id, tx, max_per_shard));
+            state.shards.insert(shard_id, Shard::new(shard_id, tx, max_per_shard));
         }
 
-        // Store handle
+        // Store handle using HashMap insert
         {
             let mut handles = self.shard_handles.write();
-            handles.push(handle);
+            handles.insert(shard_id, handle);
         }
 
         // Initialize metrics
@@ -808,7 +953,7 @@ impl<H: WebSocketHandler> Drop for ShardManager<H> {
     fn drop(&mut self) {
         // Abort all shard handles to prevent orphaned tasks
         let handles = std::mem::take(&mut *self.shard_handles.write());
-        for handle in handles {
+        for (_shard_id, handle) in handles {
             handle.abort();
         }
     }
@@ -816,5 +961,154 @@ impl<H: WebSocketHandler> Drop for ShardManager<H> {
 
 #[cfg(test)]
 mod tests {
-    // Integration tests with ws_mock would go here
+    use super::*;
+    use crate::handler::WebSocketHandler;
+    use tokio_tungstenite::tungstenite::Message;
+
+    // Minimal handler for testing
+    struct TestHandler;
+
+    impl WebSocketHandler for TestHandler {
+        type Subscription = String;
+
+        async fn url(&self, _state: &crate::handler::ConnectionState) -> String {
+            "wss://example.com".to_string()
+        }
+
+        async fn on_connect(&self, _state: &crate::handler::ConnectionState) -> Vec<Message> {
+            vec![]
+        }
+
+        async fn on_message(&self, _message: Message, _state: &crate::handler::ConnectionState) {}
+
+        fn subscriptions(&self) -> Vec<Self::Subscription> {
+            vec![]
+        }
+
+        fn subscription_message(&self, _subs: &[Self::Subscription]) -> Option<Message> {
+            None
+        }
+    }
+
+    #[test]
+    fn test_shard_freshness_no_shard() {
+        let config = ShardManagerConfig::default();
+        let manager = ShardManager::new(config, TestHandler);
+
+        // No shards exist yet
+        assert!(manager.shard_freshness(0).is_none());
+    }
+
+    #[test]
+    fn test_is_subscription_fresh_not_subscribed() {
+        let config = ShardManagerConfig::default();
+        let manager = ShardManager::new(config, TestHandler);
+
+        // Subscription doesn't exist
+        assert!(!manager.is_subscription_fresh(&"unknown".to_string(), Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn test_shard_freshness_disconnected() {
+        let config = ShardManagerConfig::default();
+        let manager = ShardManager::new(config, TestHandler);
+
+        // Simulate a disconnected shard
+        manager.metrics.update_shard(0, |s| {
+            s.is_connected = false;
+            s.last_message_at = Some(std::time::Instant::now());
+        });
+
+        // Should return None because disconnected
+        assert!(manager.shard_freshness(0).is_none());
+    }
+
+    #[test]
+    fn test_shard_freshness_connected_with_data() {
+        let config = ShardManagerConfig::default();
+        let manager = ShardManager::new(config, TestHandler);
+
+        // Simulate a connected shard with recent data
+        manager.metrics.update_shard(0, |s| {
+            s.is_connected = true;
+        });
+        // Use the atomic method to record message received (this is the actual API)
+        manager.metrics.record_shard_message_received(0);
+
+        // Should return Some duration (very small since we just set it)
+        let freshness = manager.shard_freshness(0);
+        assert!(freshness.is_some());
+        assert!(freshness.unwrap() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_websocket_health_no_shards() {
+        let config = ShardManagerConfig::default();
+        let manager = ShardManager::new(config, TestHandler);
+
+        // No shards exist yet (lazy creation) - should be considered healthy
+        let (connected, total, is_healthy) = manager.websocket_health(0.5);
+        assert_eq!(connected, 0);
+        assert_eq!(total, 0);
+        assert!(is_healthy);
+    }
+
+    #[test]
+    fn test_websocket_health_all_connected() {
+        let config = ShardManagerConfig::default();
+        let manager = ShardManager::new(config, TestHandler);
+
+        // Simulate 3 connected shards
+        for i in 0..3 {
+            manager.metrics.update_shard(i, |s| {
+                s.is_connected = true;
+            });
+        }
+
+        let (connected, total, is_healthy) = manager.websocket_health(0.5);
+        assert_eq!(connected, 3);
+        assert_eq!(total, 3);
+        assert!(is_healthy);
+    }
+
+    #[test]
+    fn test_websocket_health_partial_connected() {
+        let config = ShardManagerConfig::default();
+        let manager = ShardManager::new(config, TestHandler);
+
+        // Simulate 4 shards, only 2 connected
+        for i in 0..4 {
+            manager.metrics.update_shard(i, |s| {
+                s.is_connected = i < 2; // First 2 connected
+            });
+        }
+
+        // 50% connected should be healthy with 0.5 threshold
+        let (connected, total, is_healthy) = manager.websocket_health(0.5);
+        assert_eq!(connected, 2);
+        assert_eq!(total, 4);
+        assert!(is_healthy);
+
+        // But not healthy with 0.75 threshold
+        let (_, _, is_healthy_75) = manager.websocket_health(0.75);
+        assert!(!is_healthy_75);
+    }
+
+    #[test]
+    fn test_websocket_health_all_disconnected() {
+        let config = ShardManagerConfig::default();
+        let manager = ShardManager::new(config, TestHandler);
+
+        // Simulate 3 disconnected shards
+        for i in 0..3 {
+            manager.metrics.update_shard(i, |s| {
+                s.is_connected = false;
+            });
+        }
+
+        let (connected, total, is_healthy) = manager.websocket_health(0.5);
+        assert_eq!(connected, 0);
+        assert_eq!(total, 3);
+        assert!(!is_healthy);
+    }
 }

@@ -2,6 +2,47 @@ use parking_lot::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+/// Atomic storage for per-shard last message timestamp.
+/// Uses milliseconds since a baseline instant for efficient atomic updates.
+#[derive(Debug)]
+struct AtomicLastMessage {
+    /// Milliseconds since baseline, or 0 if never received
+    millis_since_baseline: AtomicU64,
+    /// Baseline instant (set once at creation)
+    baseline: Instant,
+}
+
+impl AtomicLastMessage {
+    fn new() -> Self {
+        Self {
+            millis_since_baseline: AtomicU64::new(0),
+            baseline: Instant::now(),
+        }
+    }
+
+    /// Record that a message was received now
+    #[inline]
+    fn record_now(&self) {
+        let millis = self.baseline.elapsed().as_millis() as u64;
+        // Use saturating_add to prevent overflow (would take ~584 million years)
+        self.millis_since_baseline.store(millis.saturating_add(1), Ordering::Release);
+    }
+
+    /// Get elapsed time since last message, or None if no message received
+    #[inline]
+    fn elapsed(&self) -> Option<Duration> {
+        let stored = self.millis_since_baseline.load(Ordering::Acquire);
+        if stored == 0 {
+            return None;
+        }
+        // stored is millis + 1, so subtract 1
+        let last_message_millis = stored - 1;
+        let now_millis = self.baseline.elapsed().as_millis() as u64;
+        let elapsed_millis = now_millis.saturating_sub(last_message_millis);
+        Some(Duration::from_millis(elapsed_millis))
+    }
+}
+
 /// Metrics for observability.
 ///
 /// This struct provides counters and gauges for monitoring WebSocket health.
@@ -44,6 +85,10 @@ pub struct Metrics {
 
     /// Per-shard metrics
     shard_metrics: RwLock<Vec<ShardMetrics>>,
+
+    /// Per-shard atomic last message timestamps (lock-free updates)
+    /// Indexed by shard_id. Grows as needed via RwLock.
+    shard_last_message: RwLock<Vec<AtomicLastMessage>>,
 }
 
 /// Metrics for a single shard
@@ -193,6 +238,38 @@ impl Metrics {
         self.messages_received_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record message received for a specific shard (lock-free fast path).
+    ///
+    /// Updates the shard's `last_message_at` timestamp atomically without acquiring
+    /// a write lock. This is critical for performance as it's called on every message.
+    #[inline]
+    pub(crate) fn record_shard_message_received(&self, shard_id: usize) {
+        // Fast path: try to update existing atomic
+        {
+            let atomics = self.shard_last_message.read();
+            if let Some(atomic) = atomics.get(shard_id) {
+                atomic.record_now();
+                return;
+            }
+        }
+
+        // Slow path: need to grow the vector
+        let mut atomics = self.shard_last_message.write();
+        while atomics.len() <= shard_id {
+            atomics.push(AtomicLastMessage::new());
+        }
+        atomics[shard_id].record_now();
+    }
+
+    /// Get time since last message for a shard (lock-free read).
+    ///
+    /// Returns `None` if the shard doesn't exist or has never received a message.
+    #[inline]
+    pub fn shard_time_since_last_message(&self, shard_id: usize) -> Option<Duration> {
+        let atomics = self.shard_last_message.read();
+        atomics.get(shard_id).and_then(|a| a.elapsed())
+    }
+
     /// Increment message sent counter
     pub(crate) fn record_message_sent(&self) {
         self.messages_sent_total.fetch_add(1, Ordering::Relaxed);
@@ -264,7 +341,19 @@ impl Metrics {
 
     /// Get a snapshot of all shard metrics with computed durations
     pub fn shard_metrics(&self) -> Vec<ShardMetrics> {
-        self.shard_metrics.read().iter().map(|s| s.snapshot()).collect()
+        let shards = self.shard_metrics.read();
+        let atomics = self.shard_last_message.read();
+
+        shards
+            .iter()
+            .enumerate()
+            .map(|(idx, s)| {
+                let mut snapshot = s.snapshot();
+                // Override time_since_last_message with atomic value
+                snapshot.time_since_last_message = atomics.get(idx).and_then(|a| a.elapsed());
+                snapshot
+            })
+            .collect()
     }
 
     /// Get a single shard's subscription count without cloning all metrics.
@@ -302,7 +391,17 @@ impl Metrics {
     pub fn snapshot(&self) -> MetricsSnapshot {
         // Take the shard lock once to ensure consistency
         let shards = self.shard_metrics.read();
-        let shard_snapshots: Vec<ShardMetrics> = shards.iter().map(|s| s.snapshot()).collect();
+        let atomics = self.shard_last_message.read();
+        let shard_snapshots: Vec<ShardMetrics> = shards
+            .iter()
+            .enumerate()
+            .map(|(idx, s)| {
+                let mut snapshot = s.snapshot();
+                // Override time_since_last_message with atomic value
+                snapshot.time_since_last_message = atomics.get(idx).and_then(|a| a.elapsed());
+                snapshot
+            })
+            .collect();
 
         MetricsSnapshot {
             connections_total: self.connections_total.load(Ordering::Acquire),
@@ -429,5 +528,41 @@ mod tests {
         assert_eq!(metrics.messages_received(), 2);
         assert_eq!(metrics.errors(), 1);
         assert_eq!(metrics.messages_sent(), 0);
+    }
+
+    #[test]
+    fn test_shard_message_received_updates_last_message_time() {
+        let metrics = Metrics::new();
+
+        // Initially no message time
+        assert!(metrics.shard_time_since_last_message(0).is_none());
+
+        // Record a message
+        metrics.record_shard_message_received(0);
+
+        // Now we should have a time
+        let elapsed = metrics.shard_time_since_last_message(0);
+        assert!(elapsed.is_some());
+        assert!(elapsed.unwrap() < Duration::from_secs(1));
+
+        // Verify it shows up in shard_metrics snapshot
+        metrics.update_shard(0, |s| s.is_connected = true);
+        let shard_snapshots = metrics.shard_metrics();
+        assert!(!shard_snapshots.is_empty());
+        assert!(shard_snapshots[0].time_since_last_message.is_some());
+        assert!(shard_snapshots[0].time_since_last_message.unwrap() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_shard_message_received_grows_vector() {
+        let metrics = Metrics::new();
+
+        // Record for shard 5 (should grow the vector)
+        metrics.record_shard_message_received(5);
+
+        assert!(metrics.shard_time_since_last_message(5).is_some());
+        // Previous shards should still be None
+        assert!(metrics.shard_time_since_last_message(0).is_none());
+        assert!(metrics.shard_time_since_last_message(4).is_none());
     }
 }

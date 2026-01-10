@@ -9,13 +9,17 @@ keywords = ["websocket", "sharding", "reconnection", "async"]
 categories = ["network-programming", "asynchronous"]
 
 [dependencies]
-tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
+tokio = { version = "1", features = ["rt", "time", "sync", "macros", "net"] }
 tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+tokio-socks = "0.5"
 futures-util = "0.3"
 tracing = "0.1"
 thiserror = "1"
 rand = "0.8"
 parking_lot = "0.12"
+socket2 = "0.5"
+native-tls = "0.2"
+url = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
