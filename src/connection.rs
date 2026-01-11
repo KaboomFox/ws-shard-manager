@@ -29,6 +29,22 @@ pub enum ConnectionCommand {
     Reconnect,
 }
 
+/// Sanitize a proxy URL for logging by removing credentials.
+/// Returns the URL with username/password replaced with "***" if present.
+fn sanitize_proxy_url(proxy: &str) -> String {
+    match Url::parse(proxy) {
+        Ok(mut url) => {
+            if !url.username().is_empty() || url.password().is_some() {
+                // Replace credentials with placeholder
+                let _ = url.set_username("***");
+                let _ = url.set_password(Some("***"));
+            }
+            url.to_string()
+        }
+        Err(_) => "[invalid-url]".to_string(),
+    }
+}
+
 /// Manages a single WebSocket connection with auto-reconnection
 pub struct Connection<H: WebSocketHandler> {
     shard_id: usize,
@@ -47,31 +63,6 @@ pub struct Connection<H: WebSocketHandler> {
 }
 
 impl<H: WebSocketHandler> Connection<H> {
-    /// Create a new connection manager (used for hot switchover connections)
-    #[allow(dead_code)]
-    pub fn new(
-        shard_id: usize,
-        handler: Arc<H>,
-        config: ConnectionConfig,
-        backoff: BackoffConfig,
-        health_config: HealthConfig,
-        metrics: Arc<Metrics>,
-        command_rx: mpsc::Receiver<ConnectionCommand>,
-    ) -> Self {
-        Self {
-            shard_id,
-            handler,
-            config,
-            backoff,
-            health_config,
-            metrics,
-            command_rx,
-            ready_tx: None,
-            initial_subscriptions: None,
-            switchover_tx: None,
-        }
-    }
-
     /// Create a new connection with a switchover request channel
     #[allow(clippy::too_many_arguments)]
     pub fn with_switchover_channel(
@@ -312,7 +303,10 @@ impl<H: WebSocketHandler> Connection<H> {
 
         debug!(
             "[SHARD-{}] Connecting to {} (source_ip={:?}, proxy={:?})",
-            self.shard_id, url, source_ip, proxy
+            self.shard_id,
+            url,
+            source_ip,
+            proxy.map(sanitize_proxy_url)
         );
 
         // Connect with timeout, using source IP and/or proxy if configured

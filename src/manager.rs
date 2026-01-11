@@ -74,6 +74,19 @@ impl<S: Clone + Eq + std::hash::Hash> Default for ManagerState<S> {
     }
 }
 
+/// Guard that removes a shard from the switchover set on drop.
+/// Ensures cleanup even if the switchover panics.
+struct SwitchoverGuard<'a, S: Clone + Eq + std::hash::Hash> {
+    state: &'a RwLock<ManagerState<S>>,
+    shard_id: usize,
+}
+
+impl<S: Clone + Eq + std::hash::Hash> Drop for SwitchoverGuard<'_, S> {
+    fn drop(&mut self) {
+        self.state.write().shards_in_switchover.remove(&self.shard_id);
+    }
+}
+
 impl<H: WebSocketHandler> ShardManager<H> {
     /// Create a new shard manager
     pub fn new(config: ShardManagerConfig, handler: H) -> Self {
@@ -763,23 +776,28 @@ impl<H: WebSocketHandler> ShardManager<H> {
             return self.reconnect_shard(shard_id).await;
         }
 
-        info!("[SHARD-{}] Starting hot switchover", shard_id);
-        self.metrics.record_hot_switchover();
-
-        // Mark shard as in switchover to block new subscriptions
+        // Check if switchover already in progress for this shard (prevent concurrent switchovers)
         {
             let mut state = self.state.write();
+            if state.shards_in_switchover.contains(&shard_id) {
+                info!("[SHARD-{}] Hot switchover already in progress, skipping", shard_id);
+                return Ok(());
+            }
             state.shards_in_switchover.insert(shard_id);
         }
 
-        // Use a scope guard pattern to ensure we clean up on all exit paths
+        // Create guard AFTER inserting - ensures cleanup on all exit paths including panic
+        let _guard = SwitchoverGuard {
+            state: &self.state,
+            shard_id,
+        };
+
+        info!("[SHARD-{}] Starting hot switchover", shard_id);
+        self.metrics.record_hot_switchover();
+
         let result = self.do_hot_switchover(shard_id).await;
 
-        // Always remove from switchover set
-        {
-            let mut state = self.state.write();
-            state.shards_in_switchover.remove(&shard_id);
-        }
+        // Guard automatically removes from switchover set on drop
 
         if let Err(ref e) = result {
             self.metrics.record_hot_switchover_failed();
