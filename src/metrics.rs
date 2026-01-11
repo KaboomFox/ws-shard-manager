@@ -25,7 +25,8 @@ impl AtomicLastMessage {
     fn record_now(&self) {
         let millis = self.baseline.elapsed().as_millis() as u64;
         // Use saturating_add to prevent overflow (would take ~584 million years)
-        self.millis_since_baseline.store(millis.saturating_add(1), Ordering::Release);
+        self.millis_since_baseline
+            .store(millis.saturating_add(1), Ordering::Release);
     }
 
     /// Get elapsed time since last message, or None if no message received
@@ -213,7 +214,8 @@ impl Metrics {
 
     /// Get total subscription send failures
     pub fn subscription_send_failures(&self) -> u64 {
-        self.subscription_send_failures_total.load(Ordering::Relaxed)
+        self.subscription_send_failures_total
+            .load(Ordering::Relaxed)
     }
 
     /// Get total circuit breaker trips
@@ -414,8 +416,12 @@ impl Metrics {
             health_failures_total: self.health_failures_total.load(Ordering::Acquire),
             rebalances_total: self.rebalances_total.load(Ordering::Acquire),
             hot_switchovers_total: self.hot_switchovers_total.load(Ordering::Acquire),
-            hot_switchover_failures_total: self.hot_switchover_failures_total.load(Ordering::Acquire),
-            subscription_send_failures_total: self.subscription_send_failures_total.load(Ordering::Acquire),
+            hot_switchover_failures_total: self
+                .hot_switchover_failures_total
+                .load(Ordering::Acquire),
+            subscription_send_failures_total: self
+                .subscription_send_failures_total
+                .load(Ordering::Acquire),
             circuit_breaker_trips_total: self.circuit_breaker_trips_total.load(Ordering::Acquire),
             active_connections: shard_snapshots.iter().filter(|s| s.is_connected).count(),
             total_subscriptions: shard_snapshots.iter().map(|s| s.subscription_count).sum(),

@@ -226,10 +226,10 @@ impl Default for ConnectionConfig {
             proactive_reconnect_interval: Some(Duration::from_secs(15 * 60)), // 15 minutes
             circuit_breaker_threshold: 5, // Trip after 5 consecutive failures
             circuit_breaker_reset_timeout: Duration::from_secs(60), // Wait 60s before retry
-            low_latency_mode: false, // Safe by default
-            source_ips: Vec::new(), // Empty = use system default routing
-            shards_per_ip: 10, // Default: 10 shards per IP
-            proxy: None, // No proxy by default
+            low_latency_mode: false,      // Safe by default
+            source_ips: Vec::new(),       // Empty = use system default routing
+            shards_per_ip: 10,            // Default: 10 shards per IP
+            proxy: None,                  // No proxy by default
         }
     }
 }
@@ -242,7 +242,9 @@ impl ConnectionConfig {
             return None;
         }
         let ip_index = shard_id / self.shards_per_ip;
-        self.source_ips.get(ip_index % self.source_ips.len()).map(|s| s.as_str())
+        self.source_ips
+            .get(ip_index % self.source_ips.len())
+            .map(|s| s.as_str())
     }
 }
 
@@ -273,8 +275,8 @@ impl Default for BackoffConfig {
 impl BackoffConfig {
     /// Calculate the delay for a given attempt number (0-indexed)
     pub fn delay_for_attempt(&self, attempt: u32) -> Duration {
-        let base_delay = self.initial_delay.as_millis() as f64
-            * self.multiplier.powi(attempt as i32);
+        let base_delay =
+            self.initial_delay.as_millis() as f64 * self.multiplier.powi(attempt as i32);
         let capped_delay = base_delay.min(self.max_delay.as_millis() as f64);
 
         if self.jitter {
@@ -345,9 +347,7 @@ mod tests {
         // With jitter, delay should be between 0 and the calculated delay
         for attempt in 0..5 {
             let delay = config.delay_for_attempt(attempt);
-            let max_expected = Duration::from_millis(
-                (100.0 * 2.0_f64.powi(attempt as i32)) as u64
-            );
+            let max_expected = Duration::from_millis((100.0 * 2.0_f64.powi(attempt as i32)) as u64);
             assert!(delay <= max_expected);
         }
     }

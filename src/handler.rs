@@ -75,7 +75,11 @@ pub trait WebSocketHandler: Send + Sync + 'static {
     /// Called when a message is received.
     ///
     /// This is where you process incoming data from the WebSocket.
-    fn on_message(&self, message: Message, state: &ConnectionState) -> impl Future<Output = ()> + Send;
+    fn on_message(
+        &self,
+        message: Message,
+        state: &ConnectionState,
+    ) -> impl Future<Output = ()> + Send;
 
     /// Called when the connection is closed.
     ///

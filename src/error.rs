@@ -31,10 +31,7 @@ pub enum Error {
 
     /// Connection failed after all retry attempts
     #[error("Connection failed after {attempts} attempts: {last_error}")]
-    ConnectionFailed {
-        attempts: u32,
-        last_error: String,
-    },
+    ConnectionFailed { attempts: u32, last_error: String },
 
     /// Health check failed
     #[error("Health check failed: {0}")]
@@ -46,10 +43,7 @@ pub enum Error {
 
     /// Subscription limit exceeded
     #[error("Subscription limit exceeded: {current}/{max}")]
-    SubscriptionLimitExceeded {
-        current: usize,
-        max: usize,
-    },
+    SubscriptionLimitExceeded { current: usize, max: usize },
 
     /// Handler error (user-defined)
     #[error("Handler error: {0}")]
@@ -78,7 +72,9 @@ impl Error {
             Error::ShuttingDown => ErrorKind::ShuttingDown,
             Error::CircuitBreakerOpen { .. } => ErrorKind::CircuitBreakerOpen,
             Error::Handler(_) => ErrorKind::Handler,
-            Error::SubscriptionLimitExceeded { .. } | Error::ChannelSend(_) | Error::HotSwitchoverFailed(_) => ErrorKind::Other,
+            Error::SubscriptionLimitExceeded { .. }
+            | Error::ChannelSend(_)
+            | Error::HotSwitchoverFailed(_) => ErrorKind::Other,
         }
     }
 }
@@ -99,7 +95,10 @@ pub enum SubscribeResult {
 impl SubscribeResult {
     /// Returns true if the subscription was successful or already existed
     pub fn is_success(&self) -> bool {
-        matches!(self, SubscribeResult::Success { .. } | SubscribeResult::AlreadySubscribed { .. })
+        matches!(
+            self,
+            SubscribeResult::Success { .. } | SubscribeResult::AlreadySubscribed { .. }
+        )
     }
 
     /// Returns the shard_id if available

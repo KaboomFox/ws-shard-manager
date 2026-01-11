@@ -48,13 +48,18 @@ impl<S: Clone + Eq + Hash> Shard<S> {
             let added = self.subscriptions.insert(sub);
             trace!(
                 "[SHARD-{}] add_subscription: added={}, count={}/{}",
-                self.id, added, self.subscriptions.len(), self.max_subscriptions
+                self.id,
+                added,
+                self.subscriptions.len(),
+                self.max_subscriptions
             );
             added
         } else {
             trace!(
                 "[SHARD-{}] add_subscription: at capacity ({}/{})",
-                self.id, self.subscriptions.len(), self.max_subscriptions
+                self.id,
+                self.subscriptions.len(),
+                self.max_subscriptions
             );
             false
         }
@@ -65,7 +70,10 @@ impl<S: Clone + Eq + Hash> Shard<S> {
         let removed = self.subscriptions.remove(sub);
         trace!(
             "[SHARD-{}] remove_subscription: removed={}, count={}/{}",
-            self.id, removed, self.subscriptions.len(), self.max_subscriptions
+            self.id,
+            removed,
+            self.subscriptions.len(),
+            self.max_subscriptions
         );
         removed
     }
@@ -97,13 +105,11 @@ pub fn select_shard_excluding<S: Clone + Eq + Hash>(
     last_used: &mut usize,
 ) -> Option<usize> {
     match strategy {
-        ShardSelectionStrategy::LeastLoaded => {
-            shards
-                .values()
-                .filter(|s| s.has_capacity() && !excluded.contains(&s.id))
-                .min_by_key(|s| s.subscription_count())
-                .map(|s| s.id)
-        }
+        ShardSelectionStrategy::LeastLoaded => shards
+            .values()
+            .filter(|s| s.has_capacity() && !excluded.contains(&s.id))
+            .min_by_key(|s| s.subscription_count())
+            .map(|s| s.id),
         ShardSelectionStrategy::RoundRobin => {
             // For RoundRobin with HashMap, we need to iterate through sorted keys
             // to maintain deterministic ordering
@@ -115,7 +121,10 @@ pub fn select_shard_excluding<S: Clone + Eq + Hash>(
             }
 
             // Find the starting position based on last_used
-            let start_pos = shard_ids.iter().position(|&id| id > *last_used).unwrap_or(0);
+            let start_pos = shard_ids
+                .iter()
+                .position(|&id| id > *last_used)
+                .unwrap_or(0);
 
             for i in 0..shard_ids.len() {
                 let idx = (start_pos + i) % shard_ids.len();
@@ -182,18 +191,32 @@ mod tests {
 
         // Add different amounts to each shard
         for i in 0..30 {
-            shards.get_mut(&0).unwrap().add_subscription(format!("s0-{}", i));
+            shards
+                .get_mut(&0)
+                .unwrap()
+                .add_subscription(format!("s0-{}", i));
         }
         for i in 0..10 {
-            shards.get_mut(&1).unwrap().add_subscription(format!("s1-{}", i));
+            shards
+                .get_mut(&1)
+                .unwrap()
+                .add_subscription(format!("s1-{}", i));
         }
         for i in 0..50 {
-            shards.get_mut(&2).unwrap().add_subscription(format!("s2-{}", i));
+            shards
+                .get_mut(&2)
+                .unwrap()
+                .add_subscription(format!("s2-{}", i));
         }
 
         let mut last = 0;
         let excluded = HashSet::new();
-        let selected = select_shard_excluding(&shards, &excluded, ShardSelectionStrategy::LeastLoaded, &mut last);
+        let selected = select_shard_excluding(
+            &shards,
+            &excluded,
+            ShardSelectionStrategy::LeastLoaded,
+            &mut last,
+        );
         assert_eq!(selected, Some(1)); // Shard 1 has least (10)
     }
 
@@ -204,15 +227,30 @@ mod tests {
 
         let mut last = 0;
         assert_eq!(
-            select_shard_excluding(&shards, &excluded, ShardSelectionStrategy::RoundRobin, &mut last),
+            select_shard_excluding(
+                &shards,
+                &excluded,
+                ShardSelectionStrategy::RoundRobin,
+                &mut last
+            ),
             Some(1)
         );
         assert_eq!(
-            select_shard_excluding(&shards, &excluded, ShardSelectionStrategy::RoundRobin, &mut last),
+            select_shard_excluding(
+                &shards,
+                &excluded,
+                ShardSelectionStrategy::RoundRobin,
+                &mut last
+            ),
             Some(2)
         );
         assert_eq!(
-            select_shard_excluding(&shards, &excluded, ShardSelectionStrategy::RoundRobin, &mut last),
+            select_shard_excluding(
+                &shards,
+                &excluded,
+                ShardSelectionStrategy::RoundRobin,
+                &mut last
+            ),
             Some(0)
         );
     }
@@ -225,12 +263,23 @@ mod tests {
         let mut last = 0;
 
         // Fill first shard
-        shards.get_mut(&0).unwrap().add_subscription("a".to_string());
-        shards.get_mut(&0).unwrap().add_subscription("b".to_string());
+        shards
+            .get_mut(&0)
+            .unwrap()
+            .add_subscription("a".to_string());
+        shards
+            .get_mut(&0)
+            .unwrap()
+            .add_subscription("b".to_string());
 
         // Should now select second shard
         assert_eq!(
-            select_shard_excluding(&shards, &excluded, ShardSelectionStrategy::Sequential, &mut last),
+            select_shard_excluding(
+                &shards,
+                &excluded,
+                ShardSelectionStrategy::Sequential,
+                &mut last
+            ),
             Some(1)
         );
     }
@@ -240,12 +289,23 @@ mod tests {
         let mut shards = create_test_shards(2, 1);
         let excluded = HashSet::new();
 
-        shards.get_mut(&0).unwrap().add_subscription("a".to_string());
-        shards.get_mut(&1).unwrap().add_subscription("b".to_string());
+        shards
+            .get_mut(&0)
+            .unwrap()
+            .add_subscription("a".to_string());
+        shards
+            .get_mut(&1)
+            .unwrap()
+            .add_subscription("b".to_string());
 
         let mut last = 0;
         assert_eq!(
-            select_shard_excluding(&shards, &excluded, ShardSelectionStrategy::LeastLoaded, &mut last),
+            select_shard_excluding(
+                &shards,
+                &excluded,
+                ShardSelectionStrategy::LeastLoaded,
+                &mut last
+            ),
             None
         );
     }
@@ -259,7 +319,12 @@ mod tests {
         excluded.insert(1);
 
         let mut last = 0;
-        let selected = select_shard_excluding(&shards, &excluded, ShardSelectionStrategy::LeastLoaded, &mut last);
+        let selected = select_shard_excluding(
+            &shards,
+            &excluded,
+            ShardSelectionStrategy::LeastLoaded,
+            &mut last,
+        );
         // Should select shard 0 or 2, not 1
         assert!(selected == Some(0) || selected == Some(2));
         assert_ne!(selected, Some(1));
@@ -284,18 +349,43 @@ mod tests {
         let mut last = 0;
 
         // Should work correctly with non-contiguous IDs
-        let selected = select_shard_excluding(&shards, &excluded, ShardSelectionStrategy::Sequential, &mut last);
+        let selected = select_shard_excluding(
+            &shards,
+            &excluded,
+            ShardSelectionStrategy::Sequential,
+            &mut last,
+        );
         assert_eq!(selected, Some(5)); // First available by sorted order
 
         // LeastLoaded should also work
-        let selected = select_shard_excluding(&shards, &excluded, ShardSelectionStrategy::LeastLoaded, &mut last);
+        let selected = select_shard_excluding(
+            &shards,
+            &excluded,
+            ShardSelectionStrategy::LeastLoaded,
+            &mut last,
+        );
         assert!(selected.is_some());
 
         // RoundRobin should cycle through
         let mut last = 0;
-        let first = select_shard_excluding(&shards, &excluded, ShardSelectionStrategy::RoundRobin, &mut last);
-        let second = select_shard_excluding(&shards, &excluded, ShardSelectionStrategy::RoundRobin, &mut last);
-        let third = select_shard_excluding(&shards, &excluded, ShardSelectionStrategy::RoundRobin, &mut last);
+        let first = select_shard_excluding(
+            &shards,
+            &excluded,
+            ShardSelectionStrategy::RoundRobin,
+            &mut last,
+        );
+        let second = select_shard_excluding(
+            &shards,
+            &excluded,
+            ShardSelectionStrategy::RoundRobin,
+            &mut last,
+        );
+        let third = select_shard_excluding(
+            &shards,
+            &excluded,
+            ShardSelectionStrategy::RoundRobin,
+            &mut last,
+        );
 
         assert!(first.is_some());
         assert!(second.is_some());

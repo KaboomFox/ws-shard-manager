@@ -129,7 +129,8 @@ impl<H: WebSocketHandler> Connection<H> {
             if let Some(tripped_at) = circuit_breaker_tripped_at {
                 if tripped_at.elapsed() < self.config.circuit_breaker_reset_timeout {
                     // Circuit breaker is open - wait for reset timeout
-                    let remaining = self.config.circuit_breaker_reset_timeout - tripped_at.elapsed();
+                    let remaining =
+                        self.config.circuit_breaker_reset_timeout - tripped_at.elapsed();
                     warn!(
                         "[SHARD-{}] Circuit breaker open, waiting {:?} before retry",
                         self.shard_id, remaining
@@ -156,7 +157,9 @@ impl<H: WebSocketHandler> Connection<H> {
                 let delay = self.backoff.delay_for_attempt(reconnect_attempt);
                 debug!(
                     "[SHARD-{}] Reconnecting in {:?} (attempt {})",
-                    self.shard_id, delay, reconnect_attempt + 1
+                    self.shard_id,
+                    delay,
+                    reconnect_attempt + 1
                 );
                 tokio::time::sleep(delay).await;
             }
@@ -176,7 +179,10 @@ impl<H: WebSocketHandler> Connection<H> {
                     consecutive_failures += 1;
                     warn!(
                         "[SHARD-{}] Connection error: {} (attempt {}, consecutive failures: {})",
-                        self.shard_id, e, reconnect_attempt + 1, consecutive_failures
+                        self.shard_id,
+                        e,
+                        reconnect_attempt + 1,
+                        consecutive_failures
                     );
 
                     // Check if we should trip the circuit breaker
@@ -242,10 +248,7 @@ impl<H: WebSocketHandler> Connection<H> {
                         shard_id, e
                     );
                 } else {
-                    warn!(
-                        "[SHARD-{}] Handler.on_error task failed: {:?}",
-                        shard_id, e
-                    );
+                    warn!("[SHARD-{}] Handler.on_error task failed: {:?}", shard_id, e);
                 }
                 true
             }
@@ -262,7 +265,11 @@ impl<H: WebSocketHandler> Connection<H> {
         if self.config.low_latency_mode {
             // Direct call - no spawn overhead (~1-5µs savings per message)
             self.handler.on_message(message, state).await;
-            trace!("[SHARD-{}] Handler processed message in {:?}", self.shard_id, start.elapsed());
+            trace!(
+                "[SHARD-{}] Handler processed message in {:?}",
+                self.shard_id,
+                start.elapsed()
+            );
         } else {
             // Spawn for panic protection
             let handler = self.handler.clone();
@@ -273,7 +280,11 @@ impl<H: WebSocketHandler> Connection<H> {
                 let start = Instant::now();
                 let fut = AssertUnwindSafe(handler.on_message(message, &state_clone));
                 fut.await;
-                trace!("[SHARD-{}] Handler processed message in {:?}", shard_id, start.elapsed());
+                trace!(
+                    "[SHARD-{}] Handler processed message in {:?}",
+                    shard_id,
+                    start.elapsed()
+                );
             })
             .await;
 
@@ -565,10 +576,12 @@ async fn connect_with_options(
         last_error: format!("Invalid URL: {}", e),
     })?;
 
-    let host = parsed_url.host_str().ok_or_else(|| Error::ConnectionFailed {
-        attempts: 0,
-        last_error: "No host in URL".to_string(),
-    })?;
+    let host = parsed_url
+        .host_str()
+        .ok_or_else(|| Error::ConnectionFailed {
+            attempts: 0,
+            last_error: "No host in URL".to_string(),
+        })?;
 
     let is_tls = parsed_url.scheme() == "wss";
     let port = parsed_url.port().unwrap_or(if is_tls { 443 } else { 80 });
@@ -643,23 +656,29 @@ async fn connect_direct(
 
     // Bind to source IP if specified
     if let Some(ip) = source_ip {
-        let source_addr: SocketAddr = format!("{}:0", ip).parse().map_err(|e| {
-            Error::ConnectionFailed {
+        let source_addr: SocketAddr =
+            format!("{}:0", ip)
+                .parse()
+                .map_err(|e| Error::ConnectionFailed {
+                    attempts: 0,
+                    last_error: format!("Invalid source IP '{}': {}", ip, e),
+                })?;
+        socket
+            .bind(source_addr)
+            .map_err(|e| Error::ConnectionFailed {
                 attempts: 0,
-                last_error: format!("Invalid source IP '{}': {}", ip, e),
-            }
-        })?;
-        socket.bind(source_addr).map_err(|e| Error::ConnectionFailed {
-            attempts: 0,
-            last_error: format!("Failed to bind to {}: {}", ip, e),
-        })?;
+                last_error: format!("Failed to bind to {}: {}", ip, e),
+            })?;
     }
 
     // Connect
-    socket.connect(dest_addr).await.map_err(|e| Error::ConnectionFailed {
-        attempts: 0,
-        last_error: format!("TCP connect to {} failed: {}", dest_addr, e),
-    })
+    socket
+        .connect(dest_addr)
+        .await
+        .map_err(|e| Error::ConnectionFailed {
+            attempts: 0,
+            last_error: format!("TCP connect to {} failed: {}", dest_addr, e),
+        })
 }
 
 /// Connect via SOCKS5 or HTTP CONNECT proxy
@@ -755,12 +774,13 @@ async fn connect_via_proxy(
                 let mut total_bytes_read: usize = 0;
 
                 // Read status line with length limit
-                let bytes_read = read_line_limited(&mut reader, &mut response_line, MAX_LINE_LENGTH)
-                    .await
-                    .map_err(|e| Error::ConnectionFailed {
-                        attempts: 0,
-                        last_error: format!("Failed to read CONNECT response: {}", e),
-                    })?;
+                let bytes_read =
+                    read_line_limited(&mut reader, &mut response_line, MAX_LINE_LENGTH)
+                        .await
+                        .map_err(|e| Error::ConnectionFailed {
+                            attempts: 0,
+                            last_error: format!("Failed to read CONNECT response: {}", e),
+                        })?;
 
                 if bytes_read == 0 {
                     return Err(Error::ConnectionFailed {
@@ -985,7 +1005,10 @@ async fn read_line_limited<R: tokio::io::AsyncBufRead + Unpin>(
         // Convert to string and append
         let chunk = &available[..to_consume];
         let chunk_str = std::str::from_utf8(chunk).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid UTF-8: {}", e))
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Invalid UTF-8: {}", e),
+            )
         })?;
         buf.push_str(chunk_str);
         total_read += to_consume;
@@ -1028,8 +1051,14 @@ mod tests {
             parse_http_status_line("HTTP/1.1 407 Proxy Authentication Required\r\n"),
             Some(407)
         );
-        assert_eq!(parse_http_status_line("HTTP/1.1 502 Bad Gateway\r\n"), Some(502));
-        assert_eq!(parse_http_status_line("HTTP/1.1 100 Continue\r\n"), Some(100));
+        assert_eq!(
+            parse_http_status_line("HTTP/1.1 502 Bad Gateway\r\n"),
+            Some(502)
+        );
+        assert_eq!(
+            parse_http_status_line("HTTP/1.1 100 Continue\r\n"),
+            Some(100)
+        );
         assert_eq!(parse_http_status_line("HTTP/1.1 599 Custom\r\n"), Some(599));
     }
 
@@ -1072,12 +1101,16 @@ mod tests {
         let mut reader = BufReader::new(&data[..]);
         let mut buf = String::new();
 
-        let bytes = read_line_limited(&mut reader, &mut buf, 1024).await.unwrap();
+        let bytes = read_line_limited(&mut reader, &mut buf, 1024)
+            .await
+            .unwrap();
         assert_eq!(bytes, 17);
         assert_eq!(buf, "HTTP/1.1 200 OK\r\n");
 
         buf.clear();
-        let bytes = read_line_limited(&mut reader, &mut buf, 1024).await.unwrap();
+        let bytes = read_line_limited(&mut reader, &mut buf, 1024)
+            .await
+            .unwrap();
         assert_eq!(bytes, 15);
         assert_eq!(buf, "Header: value\r\n");
     }
@@ -1103,7 +1136,9 @@ mod tests {
         let mut reader = BufReader::new(&data[..]);
         let mut buf = String::new();
 
-        let bytes = read_line_limited(&mut reader, &mut buf, 1024).await.unwrap();
+        let bytes = read_line_limited(&mut reader, &mut buf, 1024)
+            .await
+            .unwrap();
         assert_eq!(bytes, 10);
         assert_eq!(buf, "no newline");
     }
@@ -1116,7 +1151,9 @@ mod tests {
         let mut reader = BufReader::new(&data[..]);
         let mut buf = String::new();
 
-        let bytes = read_line_limited(&mut reader, &mut buf, 1024).await.unwrap();
+        let bytes = read_line_limited(&mut reader, &mut buf, 1024)
+            .await
+            .unwrap();
         assert_eq!(bytes, 0);
         assert_eq!(buf, "");
     }

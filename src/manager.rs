@@ -83,7 +83,10 @@ struct SwitchoverGuard<'a, S: Clone + Eq + std::hash::Hash> {
 
 impl<S: Clone + Eq + std::hash::Hash> Drop for SwitchoverGuard<'_, S> {
     fn drop(&mut self) {
-        self.state.write().shards_in_switchover.remove(&self.shard_id);
+        self.state
+            .write()
+            .shards_in_switchover
+            .remove(&self.shard_id);
     }
 }
 
@@ -183,7 +186,10 @@ impl<H: WebSocketHandler> ShardManager<H> {
         let mut shard_subscriptions: HashMap<usize, Vec<H::Subscription>> = HashMap::new();
         for (i, sub) in subscriptions.into_iter().enumerate() {
             let shard_id = created_shard_ids[i % shard_count];
-            shard_subscriptions.entry(shard_id).or_default().push(sub.clone());
+            shard_subscriptions
+                .entry(shard_id)
+                .or_default()
+                .push(sub.clone());
             let mut state = self.state.write();
             if let Some(shard) = state.shards.get_mut(&shard_id) {
                 shard.subscriptions.insert(sub.clone());
@@ -265,7 +271,11 @@ impl<H: WebSocketHandler> ShardManager<H> {
         let channels: Vec<_> = {
             let mut state = self.state.write();
             state.is_running = false;
-            state.shards.values().map(|s| s.command_tx.clone()).collect()
+            state
+                .shards
+                .values()
+                .map(|s| s.command_tx.clone())
+                .collect()
         };
 
         // Send close commands outside the lock
@@ -381,7 +391,11 @@ impl<H: WebSocketHandler> ShardManager<H> {
                         (tx, sub_count)
                     };
                     state.subscription_to_shard.insert(item.clone(), shard_id);
-                    trace!("[SHARD-{}] Added subscription (count: {})", shard_id, add_result.1);
+                    trace!(
+                        "[SHARD-{}] Added subscription (count: {})",
+                        shard_id,
+                        add_result.1
+                    );
                     Ok((shard_id, add_result.0, add_result.1))
                 }
                 None if self.config.auto_rebalance => {
@@ -421,7 +435,9 @@ impl<H: WebSocketHandler> ShardManager<H> {
 
                 // Check if another thread already subscribed this item
                 if let Some(&existing_shard) = state.subscription_to_shard.get(&item) {
-                    return SubscribeResult::AlreadySubscribed { shard_id: existing_shard };
+                    return SubscribeResult::AlreadySubscribed {
+                        shard_id: existing_shard,
+                    };
                 }
 
                 // New shard should always have capacity
@@ -430,7 +446,10 @@ impl<H: WebSocketHandler> ShardManager<H> {
                     let shard = match state.shards.get_mut(&new_id) {
                         Some(s) => s,
                         None => {
-                            error!("[SHARD-{}] Newly created shard not found in HashMap", new_id);
+                            error!(
+                                "[SHARD-{}] Newly created shard not found in HashMap",
+                                new_id
+                            );
                             return SubscribeResult::Failed {
                                 error: format!("Newly created shard {} not found", new_id),
                             };
@@ -447,7 +466,11 @@ impl<H: WebSocketHandler> ShardManager<H> {
                     (tx, count)
                 };
                 state.subscription_to_shard.insert(item.clone(), new_id);
-                trace!("[SHARD-{}] Created new shard, added subscription (count: {})", new_id, add_result.1);
+                trace!(
+                    "[SHARD-{}] Created new shard, added subscription (count: {})",
+                    new_id,
+                    add_result.1
+                );
                 (new_id, add_result.0, add_result.1)
             }
         };
@@ -457,7 +480,10 @@ impl<H: WebSocketHandler> ShardManager<H> {
             .update_shard(shard_id, |s| s.subscription_count = sub_count);
 
         // Send subscribe message outside the lock
-        if let Some(msg) = self.handler.subscription_message(std::slice::from_ref(&item)) {
+        if let Some(msg) = self
+            .handler
+            .subscription_message(std::slice::from_ref(&item))
+        {
             if let Err(e) = command_tx.send(ConnectionCommand::Send(msg)).await {
                 self.metrics.record_subscription_send_failed();
                 warn!(
@@ -477,9 +503,14 @@ impl<H: WebSocketHandler> ShardManager<H> {
                 // Update metrics to reflect rollback
                 let new_count = {
                     let state = self.state.read();
-                    state.shards.get(&shard_id).map(|s| s.subscription_count()).unwrap_or(0)
+                    state
+                        .shards
+                        .get(&shard_id)
+                        .map(|s| s.subscription_count())
+                        .unwrap_or(0)
                 };
-                self.metrics.update_shard(shard_id, |s| s.subscription_count = new_count);
+                self.metrics
+                    .update_shard(shard_id, |s| s.subscription_count = new_count);
 
                 return SubscribeResult::SendFailed {
                     shard_id,
@@ -494,7 +525,7 @@ impl<H: WebSocketHandler> ShardManager<H> {
     /// Subscribe to items and return affected shard IDs.
     ///
     /// This is a convenience method that returns the shard IDs of successful
-    /// subscriptions. Use [`subscribe`] instead if you need per-item error details.
+    /// subscriptions. Use [`Self::subscribe`] instead if you need per-item error details.
     ///
     /// # Errors
     ///
@@ -557,7 +588,10 @@ impl<H: WebSocketHandler> ShardManager<H> {
                     let shard = match state.shards.get_mut(&shard_id) {
                         Some(s) => s,
                         None => {
-                            warn!("[SHARD-{}] Shard no longer exists during unsubscribe", shard_id);
+                            warn!(
+                                "[SHARD-{}] Shard no longer exists during unsubscribe",
+                                shard_id
+                            );
                             // Clean up orphaned subscriptions from the map
                             for sub in &subs {
                                 state.subscription_to_shard.remove(sub);
@@ -634,7 +668,11 @@ impl<H: WebSocketHandler> ShardManager<H> {
     ///
     /// Returns `None` if the subscription is not found.
     pub fn subscription_shard(&self, subscription: &H::Subscription) -> Option<usize> {
-        self.state.read().subscription_to_shard.get(subscription).copied()
+        self.state
+            .read()
+            .subscription_to_shard
+            .get(subscription)
+            .copied()
     }
 
     /// Get the time since last message for a shard.
@@ -654,7 +692,9 @@ impl<H: WebSocketHandler> ShardManager<H> {
         trace!(
             "[SHARD-{}] Freshness check: {:?}",
             shard_id,
-            freshness.map(|d| format!("{}ms", d.as_millis())).unwrap_or_else(|| "no data".to_string())
+            freshness
+                .map(|d| format!("{}ms", d.as_millis()))
+                .unwrap_or_else(|| "no data".to_string())
         );
         freshness
     }
@@ -702,7 +742,10 @@ impl<H: WebSocketHandler> ShardManager<H> {
                 is_fresh
             }
             None => {
-                trace!("[SHARD-{}] Subscription freshness: no data -> STALE", shard_id);
+                trace!(
+                    "[SHARD-{}] Subscription freshness: no data -> STALE",
+                    shard_id
+                );
                 false
             }
         }
@@ -780,7 +823,10 @@ impl<H: WebSocketHandler> ShardManager<H> {
         {
             let mut state = self.state.write();
             if state.shards_in_switchover.contains(&shard_id) {
-                info!("[SHARD-{}] Hot switchover already in progress, skipping", shard_id);
+                info!(
+                    "[SHARD-{}] Hot switchover already in progress, skipping",
+                    shard_id
+                );
                 return Ok(());
             }
             state.shards_in_switchover.insert(shard_id);
@@ -854,10 +900,16 @@ impl<H: WebSocketHandler> ShardManager<H> {
         let handle = tokio::spawn(async move {
             match new_connection.run().await {
                 Ok(()) => {
-                    debug!("[SHARD-{}] Hot switchover connection task exited normally", shard_id);
+                    debug!(
+                        "[SHARD-{}] Hot switchover connection task exited normally",
+                        shard_id
+                    );
                 }
                 Err(e) => {
-                    error!("[SHARD-{}] Hot switchover connection failed: {}", shard_id, e);
+                    error!(
+                        "[SHARD-{}] Hot switchover connection failed: {}",
+                        shard_id, e
+                    );
                 }
             }
         });
@@ -966,7 +1018,9 @@ impl<H: WebSocketHandler> ShardManager<H> {
         // Add shard to state using HashMap insert
         {
             let mut state = self.state.write();
-            state.shards.insert(shard_id, Shard::new(shard_id, tx, max_per_shard));
+            state
+                .shards
+                .insert(shard_id, Shard::new(shard_id, tx, max_per_shard));
         }
 
         // Store handle using HashMap insert
@@ -985,6 +1039,7 @@ impl<H: WebSocketHandler> ShardManager<H> {
     }
 
     /// Run connection with panic recovery
+    #[allow(clippy::too_many_arguments)]
     async fn run_connection_with_recovery(
         shard_id: usize,
         handler: Arc<H>,
@@ -1009,15 +1064,15 @@ impl<H: WebSocketHandler> ShardManager<H> {
             switchover_tx,
         );
 
-        match AssertUnwindSafe(connection.run())
-            .catch_unwind()
-            .await
-        {
+        match AssertUnwindSafe(connection.run()).catch_unwind().await {
             Ok(Ok(())) => {
                 debug!("[SHARD-{}] Connection task completed normally", shard_id);
             }
             Ok(Err(e)) => {
-                warn!("[SHARD-{}] Connection task ended with error: {}", shard_id, e);
+                warn!(
+                    "[SHARD-{}] Connection task ended with error: {}",
+                    shard_id, e
+                );
             }
             Err(panic_err) => {
                 // Extract panic message if possible

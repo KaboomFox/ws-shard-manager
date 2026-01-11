@@ -114,18 +114,12 @@ impl HealthMonitor {
             // If waiting for pong, next action is checking for timeout
             match self.last_ping_sent {
                 None => Duration::ZERO,
-                Some(last) => self
-                    .config
-                    .pong_timeout
-                    .saturating_sub(last.elapsed()),
+                Some(last) => self.config.pong_timeout.saturating_sub(last.elapsed()),
             }
         } else {
             match self.last_ping_sent {
                 None => Duration::ZERO,
-                Some(last) => self
-                    .config
-                    .ping_interval
-                    .saturating_sub(last.elapsed()),
+                Some(last) => self.config.ping_interval.saturating_sub(last.elapsed()),
             }
         }
     }
@@ -134,10 +128,7 @@ impl HealthMonitor {
     pub fn time_until_data_timeout(&self) -> Duration {
         match self.last_data_received {
             None => Duration::ZERO,
-            Some(last) => self
-                .config
-                .data_timeout
-                .saturating_sub(last.elapsed()),
+            Some(last) => self.config.data_timeout.saturating_sub(last.elapsed()),
         }
     }
 

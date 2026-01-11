@@ -19,7 +19,7 @@ rand = "0.8"
 parking_lot = "0.12"
 socket2 = "0.5"
 native-tls = "0.2"
-url = "2"
+url = ">=2.0, <2.4"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }

@@ -46,10 +46,18 @@ impl WebSocketHandler for PolymarketHandler {
         match message {
             Message::Text(text) => {
                 // Parse and process the message
-                info!("[SHARD-{}] Received: {}", state.shard_id, &text[..text.len().min(100)]);
+                info!(
+                    "[SHARD-{}] Received: {}",
+                    state.shard_id,
+                    &text[..text.len().min(100)]
+                );
             }
             Message::Binary(data) => {
-                info!("[SHARD-{}] Received binary: {} bytes", state.shard_id, data.len());
+                info!(
+                    "[SHARD-{}] Received binary: {} bytes",
+                    state.shard_id,
+                    data.len()
+                );
             }
             _ => {}
         }
@@ -111,11 +119,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     // Example tokens (in a real app, these would come from your data source)
-    let tokens: Vec<String> = (0..50)
-        .map(|i| format!("token-{}", i))
-        .collect();
+    let tokens: Vec<String> = (0..50).map(|i| format!("token-{}", i)).collect();
 
-    info!("Starting Polymarket WebSocket manager with {} tokens", tokens.len());
+    info!(
+        "Starting Polymarket WebSocket manager with {} tokens",
+        tokens.len()
+    );
 
     // Create handler
     let handler = PolymarketHandler::new(tokens);
@@ -139,12 +148,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Initial metrics: {:?}", metrics.snapshot());
 
     // Subscribe to more tokens dynamically
-    let new_tokens: Vec<String> = (50..60)
-        .map(|i| format!("token-{}", i))
-        .collect();
+    let new_tokens: Vec<String> = (50..60).map(|i| format!("token-{}", i)).collect();
 
     manager.subscribe_all(new_tokens).await?;
-    info!("Subscribed to 10 more tokens, total: {}", manager.total_subscriptions());
+    info!(
+        "Subscribed to 10 more tokens, total: {}",
+        manager.total_subscriptions()
+    );
 
     // Run for a while
     info!("Running... Press Ctrl+C to stop");
