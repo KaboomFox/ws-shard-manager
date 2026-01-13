@@ -177,7 +177,8 @@ impl<H: WebSocketHandler> Connection<H> {
                 Err(e) => {
                     self.metrics.record_error();
                     consecutive_failures += 1;
-                    warn!(
+                    // Log at debug level since hot switchover handles these gracefully
+                    debug!(
                         "[SHARD-{}] Connection error: {} (attempt {}, consecutive failures: {})",
                         self.shard_id,
                         e,
@@ -501,7 +502,7 @@ impl<H: WebSocketHandler> Connection<H> {
 
                         // Request hot switchover if channel available, otherwise regular reconnect
                         if let Some(ref tx) = self.switchover_tx {
-                            warn!("[SHARD-{}] Data timeout, requesting hot switchover", self.shard_id);
+                            debug!("[SHARD-{}] Data timeout, requesting hot switchover", self.shard_id);
                             // Non-blocking send - if manager is busy, fall back to regular reconnect
                             if tx.try_send(self.shard_id).is_ok() {
                                 // Continue running while manager performs switchover
@@ -509,7 +510,7 @@ impl<H: WebSocketHandler> Connection<H> {
                                 health.reset_data_timeout();
                                 continue;
                             }
-                            warn!("[SHARD-{}] Hot switchover channel full, falling back to reconnect", self.shard_id);
+                            debug!("[SHARD-{}] Hot switchover channel full, falling back to reconnect", self.shard_id);
                         } else {
                             warn!("[SHARD-{}] Data timeout, reconnecting", self.shard_id);
                         }

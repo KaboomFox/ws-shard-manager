@@ -245,7 +245,7 @@ impl<H: WebSocketHandler> ShardManager<H> {
 
         // Process all pending requests
         while let Ok(shard_id) = rx.try_recv() {
-            info!("[SHARD-{}] Processing hot switchover request", shard_id);
+            debug!("[SHARD-{}] Processing hot switchover request", shard_id);
             if let Err(e) = self.hot_switchover(shard_id).await {
                 warn!("[SHARD-{}] Hot switchover failed: {}", shard_id, e);
             } else {
@@ -838,7 +838,7 @@ impl<H: WebSocketHandler> ShardManager<H> {
             shard_id,
         };
 
-        info!("[SHARD-{}] Starting hot switchover", shard_id);
+        debug!("[SHARD-{}] Starting hot switchover", shard_id);
         self.metrics.record_hot_switchover();
 
         let result = self.do_hot_switchover(shard_id).await;
@@ -849,7 +849,7 @@ impl<H: WebSocketHandler> ShardManager<H> {
             self.metrics.record_hot_switchover_failed();
             error!("[SHARD-{}] Hot switchover failed: {}", shard_id, e);
         } else {
-            info!("[SHARD-{}] Hot switchover complete", shard_id);
+            debug!("[SHARD-{}] Hot switchover complete", shard_id);
         }
 
         result
