@@ -394,6 +394,8 @@ impl<H: WebSocketHandler> Connection<H> {
         let ping_data: Vec<u8> = format!("ping-{}", self.shard_id).into_bytes();
 
         let mut should_stop = false;
+        let mut msg_count: u64 = 0;
+        info!("[SHARD-{}] Entering message loop", self.shard_id);
 
         loop {
             // Calculate smart sleep duration based on health monitor state
@@ -409,7 +411,20 @@ impl<H: WebSocketHandler> Connection<H> {
                         Some(Ok(message)) => {
                             self.metrics.record_message_received();
                             self.metrics.record_shard_message_received(self.shard_id);
-                            trace!("[SHARD-{}] Received message: {} bytes", self.shard_id, message.len());
+                            // Log first few messages per connection for debugging
+                            msg_count += 1;
+                            if msg_count <= 5 {
+                                info!("[SHARD-{}] WS message #{}: {} bytes, type: {:?}",
+                                    self.shard_id, msg_count, message.len(),
+                                    match &message {
+                                        Message::Text(_) => "Text",
+                                        Message::Binary(_) => "Binary",
+                                        Message::Ping(_) => "Ping",
+                                        Message::Pong(_) => "Pong",
+                                        Message::Close(_) => "Close",
+                                        Message::Frame(_) => "Frame",
+                                    });
+                            }
 
                             match &message {
                                 Message::Ping(data) => {
