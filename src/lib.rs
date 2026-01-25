@@ -41,10 +41,13 @@ mod shard;
 
 pub use config::{BackoffConfig, ConfigError, ConnectionConfig, HealthConfig, ShardManagerConfig};
 pub use error::{Error, ErrorKind, SubscribeResult};
-pub use handler::{ConnectionState, WebSocketHandler};
+pub use handler::{ConnectionState, SequenceRecovery, SequenceValidation, WebSocketHandler};
 pub use manager::ShardManager;
 pub use metrics::{Metrics, MetricsSnapshot, ShardMetrics};
 pub use shard::ShardSelectionStrategy;
+
+// Re-export http types for connection_headers
+pub use http::{HeaderName, HeaderValue};
 
 /// Result type for ws-shard-manager operations
 pub type Result<T> = std::result::Result<T, Error>;

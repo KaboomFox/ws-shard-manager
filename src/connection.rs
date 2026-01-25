@@ -1,8 +1,9 @@
 use crate::config::{BackoffConfig, ConnectionConfig, HealthConfig};
 use crate::error::Error;
-use crate::handler::{ConnectionState, WebSocketHandler};
+use crate::handler::{ConnectionState, SequenceRecovery, WebSocketHandler};
 use crate::health::HealthMonitor;
 use crate::metrics::Metrics;
+use http::{HeaderName, HeaderValue};
 use futures_util::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
@@ -310,21 +311,23 @@ impl<H: WebSocketHandler> Connection<H> {
     /// Returns Ok(true) if should stop, Ok(false) if should reconnect
     async fn connect_and_run(&mut self, state: &ConnectionState) -> Result<bool, Error> {
         let url = self.handler.url(state).await;
+        let headers = self.handler.connection_headers(state).await;
         let source_ip = self.config.source_ip_for_shard(self.shard_id);
         let proxy = self.config.proxy.as_deref();
 
         debug!(
-            "[SHARD-{}] Connecting to {} (source_ip={:?}, proxy={:?})",
+            "[SHARD-{}] Connecting to {} (source_ip={:?}, proxy={:?}, headers={})",
             self.shard_id,
             url,
             source_ip,
-            proxy.map(sanitize_proxy_url)
+            proxy.map(sanitize_proxy_url),
+            headers.len()
         );
 
-        // Connect with timeout, using source IP and/or proxy if configured
+        // Connect with timeout, using source IP, proxy, and custom headers
         let ws_stream = match timeout(
             self.config.connect_timeout,
-            connect_with_options(&url, source_ip, proxy),
+            connect_with_options(&url, source_ip, proxy, headers),
         )
         .await
         {
@@ -354,6 +357,9 @@ impl<H: WebSocketHandler> Connection<H> {
         info!("[SHARD-{}] Connected to {} ({})", self.shard_id, url, via);
 
         let (mut write, mut read) = ws_stream.split();
+
+        // Reset sequence tracking state for new connection
+        self.handler.reset_sequence_state(state);
 
         // Send initial messages from handler
         let init_messages = self.handler.on_connect(state).await;
@@ -449,6 +455,53 @@ impl<H: WebSocketHandler> Connection<H> {
                                     if self.handler.is_heartbeat(&message) {
                                         debug!("[SHARD-{}] Received application heartbeat", self.shard_id);
                                     }
+
+                                    // Validate sequence number before processing
+                                    let validation = self.handler.validate_sequence(&message, state);
+                                    if !validation.is_valid {
+                                        match validation.recovery {
+                                            SequenceRecovery::Continue => {
+                                                // Log but continue processing
+                                                debug!(
+                                                    "[SHARD-{}] Sequence validation failed, continuing",
+                                                    self.shard_id
+                                                );
+                                            }
+                                            SequenceRecovery::DropMessage => {
+                                                // Skip this message
+                                                debug!(
+                                                    "[SHARD-{}] Dropping message due to sequence gap",
+                                                    self.shard_id
+                                                );
+                                                // Send resubscription if requested
+                                                if !validation.resubscribe.is_empty() {
+                                                    if let Some(resub_msg) = self.handler.resubscription_message(&validation.resubscribe) {
+                                                        if let Err(e) = write.send(resub_msg).await {
+                                                            warn!(
+                                                                "[SHARD-{}] Failed to send resubscription: {}",
+                                                                self.shard_id, e
+                                                            );
+                                                        } else {
+                                                            info!(
+                                                                "[SHARD-{}] Sent resubscription for {} items due to sequence gap",
+                                                                self.shard_id, validation.resubscribe.len()
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                                continue; // Skip on_message for this message
+                                            }
+                                            SequenceRecovery::Reconnect => {
+                                                // Trigger reconnection
+                                                warn!(
+                                                    "[SHARD-{}] Sequence gap detected, reconnecting",
+                                                    self.shard_id
+                                                );
+                                                break;
+                                            }
+                                        }
+                                    }
+
                                     // Let handler process the message
                                     self.call_on_message(message, state).await;
                                 }
@@ -575,16 +628,18 @@ impl<H: WebSocketHandler> Connection<H> {
 /// Type alias for WebSocket stream
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
-/// Connect to WebSocket with optional source IP binding and proxy support.
+/// Connect to WebSocket with optional source IP binding, proxy support, and custom headers.
 ///
 /// # Arguments
 /// * `url` - WebSocket URL (wss:// or ws://)
 /// * `source_ip` - Optional source IP to bind outgoing connection
 /// * `proxy` - Optional proxy URL (socks5://host:port or http://host:port)
+/// * `headers` - Additional headers to include in the connection request (e.g., auth)
 async fn connect_with_options(
     url: &str,
     source_ip: Option<&str>,
     proxy: Option<&str>,
+    headers: Vec<(HeaderName, HeaderValue)>,
 ) -> Result<WsStream, Error> {
     // Parse URL
     let parsed_url = Url::parse(url).map_err(|e| Error::ConnectionFailed {
@@ -603,12 +658,17 @@ async fn connect_with_options(
     let port = parsed_url.port().unwrap_or(if is_tls { 443 } else { 80 });
 
     // Build the WebSocket request
-    let request = url
+    let mut request = url
         .into_client_request()
         .map_err(|e| Error::ConnectionFailed {
             attempts: 0,
             last_error: format!("Invalid WebSocket request: {}", e),
         })?;
+
+    // Add custom headers (e.g., authentication)
+    for (name, value) in headers {
+        request.headers_mut().insert(name, value);
+    }
 
     // Connect based on proxy/source_ip configuration
     let tcp_stream = if let Some(proxy_url) = proxy {
