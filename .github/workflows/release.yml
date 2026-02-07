@@ -43,13 +43,20 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
 
-      - name: Commit changelog
+      - name: Update README version
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+          MAJOR_MINOR="${VERSION%.*}"
+          sed -i "s/ws-shard-manager = \"[^\"]*\"/ws-shard-manager = \"${MAJOR_MINOR}\"/" README.md
+
+      - name: Commit release updates
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add CHANGELOG.md
+          git add CHANGELOG.md README.md
           git diff --staged --quiet && exit 0
-          git commit -m "Update CHANGELOG.md for ${{ github.ref_name }} [skip ci]"
+          git commit -m "Update CHANGELOG.md and README.md for ${{ github.ref_name }} [skip ci]"
           git push origin main
 
   publish:
