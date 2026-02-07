@@ -19,6 +19,10 @@ use tokio_tungstenite::{
 use tracing::{debug, error, info, trace, warn};
 use url::Url;
 
+/// A callback that provides the current subscriptions for a shard.
+/// Called on every connect/reconnect to get the latest subscription state.
+pub(crate) type SubscriptionProvider<S> = Arc<dyn Fn() -> Vec<S> + Send + Sync>;
+
 /// Commands that can be sent to a connection
 #[derive(Debug)]
 pub enum ConnectionCommand {
@@ -75,8 +79,8 @@ pub struct Connection<H: WebSocketHandler> {
     command_rx: mpsc::Receiver<ConnectionCommand>,
     /// Optional channel to signal when connection is ready
     ready_tx: Option<oneshot::Sender<()>>,
-    /// Explicit subscriptions for this shard (used during hot switchover)
-    initial_subscriptions: Option<Vec<H::Subscription>>,
+    /// Provides current subscriptions for this shard on connect/reconnect
+    subscription_provider: SubscriptionProvider<H::Subscription>,
     /// Optional channel to request hot switchover from manager
     switchover_tx: Option<mpsc::Sender<usize>>,
 }
@@ -93,6 +97,7 @@ impl<H: WebSocketHandler> Connection<H> {
         metrics: Arc<Metrics>,
         command_rx: mpsc::Receiver<ConnectionCommand>,
         switchover_tx: mpsc::Sender<usize>,
+        subscription_provider: SubscriptionProvider<H::Subscription>,
     ) -> Self {
         Self {
             shard_id,
@@ -103,7 +108,7 @@ impl<H: WebSocketHandler> Connection<H> {
             metrics,
             command_rx,
             ready_tx: None,
-            initial_subscriptions: None,
+            subscription_provider,
             switchover_tx: Some(switchover_tx),
         }
     }
@@ -119,7 +124,7 @@ impl<H: WebSocketHandler> Connection<H> {
         metrics: Arc<Metrics>,
         command_rx: mpsc::Receiver<ConnectionCommand>,
         ready_tx: oneshot::Sender<()>,
-        subscriptions: Vec<H::Subscription>,
+        subscription_provider: SubscriptionProvider<H::Subscription>,
         switchover_tx: mpsc::Sender<usize>,
     ) -> Self {
         Self {
@@ -131,7 +136,7 @@ impl<H: WebSocketHandler> Connection<H> {
             metrics,
             command_rx,
             ready_tx: Some(ready_tx),
-            initial_subscriptions: Some(subscriptions),
+            subscription_provider,
             switchover_tx: Some(switchover_tx),
         }
     }
@@ -391,18 +396,17 @@ impl<H: WebSocketHandler> Connection<H> {
             self.metrics.record_message_sent();
         }
 
-        // If we have explicit subscriptions (hot switchover), send subscription message
-        if let Some(ref subs) = self.initial_subscriptions {
-            if !subs.is_empty() {
-                if let Some(msg) = self.handler.subscription_message(subs) {
-                    write.send(msg).await?;
-                    self.metrics.record_message_sent();
-                    info!(
-                        "[SHARD-{}] Sent {} subscriptions from hot switchover",
-                        self.shard_id,
-                        subs.len()
-                    );
-                }
+        // Replay current subscriptions from provider (works for both reconnect and hot switchover)
+        let subs = (self.subscription_provider)();
+        if !subs.is_empty() {
+            if let Some(msg) = self.handler.subscription_message(&subs) {
+                write.send(msg).await?;
+                self.metrics.record_message_sent();
+                info!(
+                    "[SHARD-{}] Replayed {} subscriptions",
+                    self.shard_id,
+                    subs.len()
+                );
             }
         }
 

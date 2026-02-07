@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -e
+
+# Pre-commit hook: runs the same checks as CI to catch issues before pushing.
+# Install: git config core.hooksPath .githooks
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+failed=0
+
+step() {
+    printf "${BOLD}[pre-commit]${NC} %s... " "$1"
+}
+
+pass() {
+    printf "${GREEN}ok${NC} (%.1fs)\n" "$1"
+}
+
+fail() {
+    printf "${RED}FAILED${NC} (%.1fs)\n" "$1"
+    failed=1
+}
+
+# 1. Format check (fastest, catches trivial issues)
+step "cargo fmt --check"
+start=$(date +%s.%N)
+if cargo fmt --all -- --check >/dev/null 2>&1; then
+    pass "$(echo "$(date +%s.%N) - $start" | bc)"
+else
+    fail "$(echo "$(date +%s.%N) - $start" | bc)"
+    echo ""
+    printf "  ${YELLOW}Fix: cargo fmt --all${NC}\n"
+    echo ""
+fi
+
+# 2. Clippy (catches warnings/lint issues)
+step "cargo clippy"
+start=$(date +%s.%N)
+if cargo clippy --all-features -- -D warnings 2>&1 | tail -20 > /tmp/pre-commit-clippy.log 2>&1; then
+    pass "$(echo "$(date +%s.%N) - $start" | bc)"
+else
+    fail "$(echo "$(date +%s.%N) - $start" | bc)"
+    echo ""
+    cat /tmp/pre-commit-clippy.log
+    echo ""
+fi
+
+# 3. Tests (catches regressions)
+step "cargo test"
+start=$(date +%s.%N)
+if cargo test --all-features 2>&1 | tail -20 > /tmp/pre-commit-test.log 2>&1; then
+    pass "$(echo "$(date +%s.%N) - $start" | bc)"
+else
+    fail "$(echo "$(date +%s.%N) - $start" | bc)"
+    echo ""
+    cat /tmp/pre-commit-test.log
+    echo ""
+fi
+
+# Result
+echo ""
+if [ "$failed" -ne 0 ]; then
+    printf "${RED}${BOLD}Pre-commit checks failed.${NC} Fix the issues above or skip with --no-verify\n"
+    exit 1
+else
+    printf "${GREEN}${BOLD}All pre-commit checks passed.${NC}\n"
+fi

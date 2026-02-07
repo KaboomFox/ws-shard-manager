@@ -1,5 +1,5 @@
 use crate::config::ShardManagerConfig;
-use crate::connection::{Connection, ConnectionCommand};
+use crate::connection::{Connection, ConnectionCommand, SubscriptionProvider};
 use crate::error::{Error, SubscribeResult};
 use crate::handler::WebSocketHandler;
 use crate::metrics::Metrics;
@@ -17,6 +17,12 @@ use tracing::{debug, error, info, trace, warn};
 
 /// Default channel buffer size
 const DEFAULT_CHANNEL_SIZE: usize = 100;
+
+/// Maximum number of panic retries before giving up on a shard
+const MAX_PANIC_RETRIES: u32 = 3;
+
+/// Delay between panic retries
+const PANIC_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Type alias for shard unsubscription data: (shard_id, items, sender, new_count)
 type ShardUnsubData<S> = (usize, Vec<S>, mpsc::Sender<ConnectionCommand>, usize);
@@ -88,6 +94,25 @@ impl<S: Clone + Eq + std::hash::Hash> Drop for SwitchoverGuard<'_, S> {
             .shards_in_switchover
             .remove(&self.shard_id);
     }
+}
+
+/// Create a subscription provider closure that reads current subscriptions from manager state.
+fn make_subscription_provider<S>(
+    state: &Arc<RwLock<ManagerState<S>>>,
+    shard_id: usize,
+) -> SubscriptionProvider<S>
+where
+    S: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
+{
+    let state = state.clone();
+    Arc::new(move || {
+        let state = state.read();
+        state
+            .shards
+            .get(&shard_id)
+            .map(|shard| shard.subscriptions.iter().cloned().collect())
+            .unwrap_or_default()
+    })
 }
 
 impl<H: WebSocketHandler> ShardManager<H> {
@@ -182,39 +207,18 @@ impl<H: WebSocketHandler> ShardManager<H> {
             created_shard_ids.push(shard_id);
         }
 
-        // Distribute initial subscriptions to shard state
-        let mut shard_subscriptions: HashMap<usize, Vec<H::Subscription>> = HashMap::new();
-        for (i, sub) in subscriptions.into_iter().enumerate() {
-            let shard_id = created_shard_ids[i % shard_count];
-            shard_subscriptions
-                .entry(shard_id)
-                .or_default()
-                .push(sub.clone());
+        // Distribute initial subscriptions to shard state.
+        // The subscription_provider in connect_and_run() will replay these
+        // automatically when each connection establishes, so no explicit
+        // send via the command channel is needed.
+        {
             let mut state = self.state.write();
-            if let Some(shard) = state.shards.get_mut(&shard_id) {
-                shard.subscriptions.insert(sub.clone());
-            }
-            state.subscription_to_shard.insert(sub, shard_id);
-        }
-
-        // Send subscription messages to each shard
-        for (shard_id, subs) in shard_subscriptions {
-            if subs.is_empty() {
-                continue;
-            }
-            let command_tx = {
-                let state = self.state.read();
-                state.shards.get(&shard_id).map(|s| s.command_tx.clone())
-            };
-            if let Some(tx) = command_tx {
-                if let Some(msg) = self.handler.subscription_message(&subs) {
-                    if let Err(e) = tx.send(ConnectionCommand::Send(msg)).await {
-                        warn!(
-                            "[SHARD-{}] Failed to send initial subscription message: {}",
-                            shard_id, e
-                        );
-                    }
+            for (i, sub) in subscriptions.into_iter().enumerate() {
+                let shard_id = created_shard_ids[i % shard_count];
+                if let Some(shard) = state.shards.get_mut(&shard_id) {
+                    shard.subscriptions.insert(sub.clone());
                 }
+                state.subscription_to_shard.insert(sub, shard_id);
             }
         }
 
@@ -857,11 +861,11 @@ impl<H: WebSocketHandler> ShardManager<H> {
 
     /// Internal hot switchover implementation
     async fn do_hot_switchover(&self, shard_id: usize) -> Result<(), Error> {
-        // Get current subscriptions for this shard
-        let subscriptions: Vec<H::Subscription> = {
+        // Verify shard exists and log subscription count
+        let sub_count = {
             let state = self.state.read();
             match state.shards.get(&shard_id) {
-                Some(shard) => shard.subscriptions.iter().cloned().collect(),
+                Some(shard) => shard.subscription_count(),
                 None => {
                     warn!("[SHARD-{}] Shard not found for hot switchover", shard_id);
                     return Err(Error::HotSwitchoverFailed(format!(
@@ -874,15 +878,16 @@ impl<H: WebSocketHandler> ShardManager<H> {
 
         info!(
             "[SHARD-{}] Hot switchover with {} subscriptions",
-            shard_id,
-            subscriptions.len()
+            shard_id, sub_count
         );
 
         // Create channels for new connection
         let (new_tx, new_rx) = mpsc::channel::<ConnectionCommand>(DEFAULT_CHANNEL_SIZE);
         let (ready_tx, ready_rx) = oneshot::channel();
 
-        // Create new connection with ready signal, explicit subscriptions, and switchover channel
+        let subscription_provider = make_subscription_provider(&self.state, shard_id);
+
+        // Create new connection with ready signal, subscription provider, and switchover channel
         let new_connection = Connection::with_ready_signal(
             shard_id,
             self.handler.clone(),
@@ -892,7 +897,7 @@ impl<H: WebSocketHandler> ShardManager<H> {
             self.metrics.clone(),
             new_rx,
             ready_tx,
-            subscriptions,
+            subscription_provider,
             self.switchover_tx.clone(),
         );
 
@@ -1010,6 +1015,14 @@ impl<H: WebSocketHandler> ShardManager<H> {
             shard_id, max_per_shard
         );
 
+        // Add shard to state BEFORE spawning so subscription_provider can read it
+        {
+            let mut state = self.state.write();
+            state
+                .shards
+                .insert(shard_id, Shard::new(shard_id, tx, max_per_shard));
+        }
+
         // Spawn connection task with panic recovery
         let handler = self.handler.clone();
         let connection_config = self.config.connection.clone();
@@ -1017,6 +1030,8 @@ impl<H: WebSocketHandler> ShardManager<H> {
         let health_config = self.config.health.clone();
         let metrics = self.metrics.clone();
         let switchover_tx = self.switchover_tx.clone();
+        let subscription_provider = make_subscription_provider(&self.state, shard_id);
+        let state = self.state.clone();
 
         let handle = tokio::spawn(async move {
             Self::run_connection_with_recovery(
@@ -1028,17 +1043,11 @@ impl<H: WebSocketHandler> ShardManager<H> {
                 metrics,
                 rx,
                 switchover_tx,
+                subscription_provider,
+                state,
             )
             .await
         });
-
-        // Add shard to state using HashMap insert
-        {
-            let mut state = self.state.write();
-            state
-                .shards
-                .insert(shard_id, Shard::new(shard_id, tx, max_per_shard));
-        }
 
         // Store handle using HashMap insert
         {
@@ -1055,7 +1064,11 @@ impl<H: WebSocketHandler> ShardManager<H> {
         Ok(())
     }
 
-    /// Run connection with panic recovery
+    /// Run connection with panic recovery.
+    ///
+    /// On panic, recreates the channel pair, updates the shard's `command_tx` in state,
+    /// and retries up to `MAX_PANIC_RETRIES` times. The subscription_provider automatically
+    /// provides current subscriptions to the new connection.
     #[allow(clippy::too_many_arguments)]
     async fn run_connection_with_recovery(
         shard_id: usize,
@@ -1064,47 +1077,92 @@ impl<H: WebSocketHandler> ShardManager<H> {
         backoff_config: crate::config::BackoffConfig,
         health_config: crate::config::HealthConfig,
         metrics: Arc<Metrics>,
-        command_rx: mpsc::Receiver<ConnectionCommand>,
+        mut command_rx: mpsc::Receiver<ConnectionCommand>,
         switchover_tx: mpsc::Sender<usize>,
+        subscription_provider: SubscriptionProvider<H::Subscription>,
+        state: Arc<RwLock<ManagerState<H::Subscription>>>,
     ) {
-        // Note: We can't easily restart the connection after channel closure,
-        // so we just catch panics within this task and log them.
-        // For full recovery, the manager would need to recreate the channel.
-        let connection = Connection::with_switchover_channel(
-            shard_id,
-            handler,
-            connection_config,
-            backoff_config,
-            health_config,
-            metrics.clone(),
-            command_rx,
-            switchover_tx,
-        );
+        let mut panic_count: u32 = 0;
 
-        match AssertUnwindSafe(connection.run()).catch_unwind().await {
-            Ok(Ok(())) => {
-                debug!("[SHARD-{}] Connection task completed normally", shard_id);
-            }
-            Ok(Err(e)) => {
-                warn!(
-                    "[SHARD-{}] Connection task ended with error: {}",
-                    shard_id, e
-                );
-            }
-            Err(panic_err) => {
-                // Extract panic message if possible
-                let panic_msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
-                    s.to_string()
-                } else if let Some(s) = panic_err.downcast_ref::<String>() {
-                    s.clone()
-                } else {
-                    "Unknown panic".to_string()
-                };
-                error!(
-                    "[SHARD-{}] Connection task PANICKED: {}. Shard is now dead.",
-                    shard_id, panic_msg
-                );
-                metrics.record_error();
+        loop {
+            let connection = Connection::with_switchover_channel(
+                shard_id,
+                handler.clone(),
+                connection_config.clone(),
+                backoff_config.clone(),
+                health_config.clone(),
+                metrics.clone(),
+                command_rx,
+                switchover_tx.clone(),
+                subscription_provider.clone(),
+            );
+
+            match AssertUnwindSafe(connection.run()).catch_unwind().await {
+                Ok(Ok(())) => {
+                    debug!("[SHARD-{}] Connection task completed normally", shard_id);
+                    return;
+                }
+                Ok(Err(e)) => {
+                    warn!(
+                        "[SHARD-{}] Connection task ended with error: {}",
+                        shard_id, e
+                    );
+                    return;
+                }
+                Err(panic_err) => {
+                    panic_count += 1;
+                    let panic_msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = panic_err.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "Unknown panic".to_string()
+                    };
+                    error!(
+                        "[SHARD-{}] Connection task PANICKED ({}/{}): {}",
+                        shard_id, panic_count, MAX_PANIC_RETRIES, panic_msg
+                    );
+                    metrics.record_error();
+
+                    if panic_count >= MAX_PANIC_RETRIES {
+                        error!(
+                            "[SHARD-{}] Max panic retries ({}) exhausted. Shard is now dead.",
+                            shard_id, MAX_PANIC_RETRIES
+                        );
+                        return;
+                    }
+
+                    // Check if shard still exists in state (may have been removed during stop)
+                    let shard_exists = {
+                        let s = state.read();
+                        s.shards.contains_key(&shard_id)
+                    };
+                    if !shard_exists {
+                        info!(
+                            "[SHARD-{}] Shard removed from state, stopping recovery",
+                            shard_id
+                        );
+                        return;
+                    }
+
+                    // Recreate channel pair and update shard state
+                    let (new_tx, new_rx) = mpsc::channel::<ConnectionCommand>(DEFAULT_CHANNEL_SIZE);
+                    {
+                        let mut s = state.write();
+                        if let Some(shard) = s.shards.get_mut(&shard_id) {
+                            shard.command_tx = new_tx;
+                        } else {
+                            info!(
+                                "[SHARD-{}] Shard removed during recovery, stopping",
+                                shard_id
+                            );
+                            return;
+                        }
+                    }
+                    command_rx = new_rx;
+
+                    tokio::time::sleep(PANIC_RETRY_DELAY).await;
+                }
             }
         }
     }
