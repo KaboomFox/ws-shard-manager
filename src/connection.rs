@@ -46,6 +46,24 @@ fn sanitize_proxy_url(proxy: &str) -> String {
     }
 }
 
+/// Sanitize a WebSocket URL for logging by removing query parameters and credentials.
+/// Query parameters often contain API keys or auth tokens.
+fn sanitize_url(url: &str) -> String {
+    match Url::parse(url) {
+        Ok(mut url) => {
+            if url.query().is_some() {
+                url.set_query(Some("***"));
+            }
+            if !url.username().is_empty() || url.password().is_some() {
+                let _ = url.set_username("***");
+                let _ = url.set_password(Some("***"));
+            }
+            url.to_string()
+        }
+        Err(_) => "[invalid-url]".to_string(),
+    }
+}
+
 /// Manages a single WebSocket connection with auto-reconnection
 pub struct Connection<H: WebSocketHandler> {
     shard_id: usize,
@@ -318,7 +336,7 @@ impl<H: WebSocketHandler> Connection<H> {
         debug!(
             "[SHARD-{}] Connecting to {} (source_ip={:?}, proxy={:?}, headers={})",
             self.shard_id,
-            url,
+            sanitize_url(&url),
             source_ip,
             proxy.map(sanitize_proxy_url),
             headers.len()
@@ -349,12 +367,17 @@ impl<H: WebSocketHandler> Connection<H> {
         });
 
         let via = match (source_ip, proxy) {
-            (Some(ip), Some(p)) => format!("{} via proxy {}", ip, p),
+            (Some(ip), Some(p)) => format!("{} via proxy {}", ip, sanitize_proxy_url(p)),
             (Some(ip), None) => ip.to_string(),
-            (None, Some(p)) => format!("proxy {}", p),
+            (None, Some(p)) => format!("proxy {}", sanitize_proxy_url(p)),
             (None, None) => "default".to_string(),
         };
-        info!("[SHARD-{}] Connected to {} ({})", self.shard_id, url, via);
+        info!(
+            "[SHARD-{}] Connected to {} ({})",
+            self.shard_id,
+            sanitize_url(&url),
+            via
+        );
 
         let (mut write, mut read) = ws_stream.split();
 
