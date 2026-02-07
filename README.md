@@ -1,5 +1,10 @@
 # ws-shard-manager
 
+[![Crates.io](https://img.shields.io/crates/v/ws-shard-manager.svg)](https://crates.io/crates/ws-shard-manager)
+[![Documentation](https://docs.rs/ws-shard-manager/badge.svg)](https://docs.rs/ws-shard-manager)
+[![CI](https://github.com/KaboomFox/ws-shard-manager/actions/workflows/ci.yml/badge.svg)](https://github.com/KaboomFox/ws-shard-manager/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A robust WebSocket connection manager for Rust with sharding, auto-reconnection, and hot switchover.
 
 ## Features
@@ -252,6 +257,10 @@ When enabled, the manager creates a new connection and waits for it to be ready 
 // Trigger manual hot switchover for a shard
 manager.hot_switchover(0).await?;
 ```
+
+## Minimum Supported Rust Version
+
+1.84
 
 ## License
 
