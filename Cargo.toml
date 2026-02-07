@@ -1,6 +1,6 @@
 [package]
 name = "ws-shard-manager"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.84"
 description = "A robust WebSocket connection manager with sharding, auto-reconnection, and hot switchover"
