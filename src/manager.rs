@@ -915,7 +915,10 @@ impl<H: WebSocketHandler> ShardManager<H> {
         });
 
         // Wait for new connection to signal ready (with timeout)
-        info!("[SHARD-{}] Waiting for new connection ready signal...", shard_id);
+        info!(
+            "[SHARD-{}] Waiting for new connection ready signal...",
+            shard_id
+        );
         match tokio::time::timeout(HOT_SWITCHOVER_TIMEOUT, ready_rx).await {
             Ok(Ok(())) => {
                 info!("[SHARD-{}] New connection signaled ready", shard_id);
@@ -937,13 +940,19 @@ impl<H: WebSocketHandler> ShardManager<H> {
         }
 
         // Gracefully close old connection and swap
-        info!("[SHARD-{}] Swapping channels (new connection ready)", shard_id);
+        info!(
+            "[SHARD-{}] Swapping channels (new connection ready)",
+            shard_id
+        );
         let old_tx = {
             let mut state = self.state.write();
             if let Some(shard) = state.shards.get_mut(&shard_id) {
                 let old = shard.command_tx.clone();
                 shard.command_tx = new_tx;
-                info!("[SHARD-{}] Channel swapped, old channel extracted", shard_id);
+                info!(
+                    "[SHARD-{}] Channel swapped, old channel extracted",
+                    shard_id
+                );
                 Some(old)
             } else {
                 warn!("[SHARD-{}] Shard not found during channel swap!", shard_id);
@@ -953,7 +962,10 @@ impl<H: WebSocketHandler> ShardManager<H> {
 
         if let Some(tx) = old_tx {
             // Send graceful close to old connection
-            info!("[SHARD-{}] Sending Close to old connection channel", shard_id);
+            info!(
+                "[SHARD-{}] Sending Close to old connection channel",
+                shard_id
+            );
             if let Err(e) = tx.send(ConnectionCommand::Close).await {
                 debug!("[SHARD-{}] Old connection already closed: {}", shard_id, e);
             }
