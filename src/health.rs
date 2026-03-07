@@ -56,13 +56,17 @@ impl HealthMonitor {
 
     /// Check if we should send a ping now
     pub fn should_send_ping(&self) -> bool {
+        let interval = match self.config.ping_interval {
+            Some(i) => i,
+            None => return false, // Pinging disabled
+        };
         if self.waiting_for_pong {
             return false; // Don't send another ping while waiting
         }
 
         match self.last_ping_sent {
             None => true, // Never sent a ping
-            Some(last) => last.elapsed() >= self.config.ping_interval,
+            Some(last) => last.elapsed() >= interval,
         }
     }
 
@@ -72,6 +76,10 @@ impl HealthMonitor {
     /// and resets the waiting_for_pong flag when a timeout is detected.
     /// Only call this once per timeout check cycle.
     pub fn check_and_record_pong_timeout(&mut self) -> bool {
+        let timeout = match self.config.pong_timeout {
+            Some(t) => t,
+            None => return false, // Pong checking disabled
+        };
         if !self.waiting_for_pong {
             return false;
         }
@@ -79,7 +87,7 @@ impl HealthMonitor {
         match self.last_ping_sent {
             None => false,
             Some(last) => {
-                if last.elapsed() >= self.config.pong_timeout {
+                if last.elapsed() >= timeout {
                     self.consecutive_ping_failures += 1;
                     self.waiting_for_pong = false; // Reset to allow next ping
                     true
@@ -108,18 +116,23 @@ impl HealthMonitor {
         self.consecutive_ping_failures >= self.config.failure_threshold
     }
 
-    /// Get time until next ping should be sent
+    /// Get time until next ping should be sent.
+    /// Returns Duration::MAX when pinging is disabled (so select! picks data_timeout instead).
     pub fn time_until_next_ping(&self) -> Duration {
+        let (ping_interval, pong_timeout) =
+            match (self.config.ping_interval, self.config.pong_timeout) {
+                (Some(pi), Some(pt)) => (pi, pt),
+                _ => return Duration::MAX, // Pinging disabled — never fires
+            };
         if self.waiting_for_pong {
-            // If waiting for pong, next action is checking for timeout
             match self.last_ping_sent {
                 None => Duration::ZERO,
-                Some(last) => self.config.pong_timeout.saturating_sub(last.elapsed()),
+                Some(last) => pong_timeout.saturating_sub(last.elapsed()),
             }
         } else {
             match self.last_ping_sent {
                 None => Duration::ZERO,
-                Some(last) => self.config.ping_interval.saturating_sub(last.elapsed()),
+                Some(last) => ping_interval.saturating_sub(last.elapsed()),
             }
         }
     }
@@ -144,8 +157,8 @@ mod tests {
 
     fn test_config() -> HealthConfig {
         HealthConfig {
-            ping_interval: Duration::from_millis(100),
-            pong_timeout: Duration::from_millis(50),
+            ping_interval: Some(Duration::from_millis(100)),
+            pong_timeout: Some(Duration::from_millis(50)),
             data_timeout: Duration::from_millis(200),
             failure_threshold: 3,
         }

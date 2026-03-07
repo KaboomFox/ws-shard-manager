@@ -117,8 +117,8 @@ let config = ShardManagerConfig::builder()
     })
     // Health monitoring
     .health(HealthConfig {
-        ping_interval: Duration::from_secs(20),
-        pong_timeout: Duration::from_secs(10),
+        ping_interval: Some(Duration::from_secs(20)), // None to disable
+        pong_timeout: Some(Duration::from_secs(10)),  // None to disable
         data_timeout: Duration::from_secs(30),
         failure_threshold: 3,
     })

@@ -108,17 +108,21 @@ impl ShardManagerConfigBuilder {
             ));
         }
 
-        // Validate health config
-        if self.config.health.pong_timeout > self.config.health.ping_interval {
-            return Err(ConfigError::InvalidHealth(
-                "pong_timeout should be <= ping_interval".to_string(),
-            ));
-        }
-
-        if self.config.health.data_timeout < self.config.health.ping_interval {
-            return Err(ConfigError::InvalidHealth(
-                "data_timeout should be >= ping_interval to avoid false positives".to_string(),
-            ));
+        // Validate health config (only when ping is enabled)
+        if let (Some(pong), Some(ping)) = (
+            self.config.health.pong_timeout,
+            self.config.health.ping_interval,
+        ) {
+            if pong > ping {
+                return Err(ConfigError::InvalidHealth(
+                    "pong_timeout should be <= ping_interval".to_string(),
+                ));
+            }
+            if self.config.health.data_timeout < ping {
+                return Err(ConfigError::InvalidHealth(
+                    "data_timeout should be >= ping_interval to avoid false positives".to_string(),
+                ));
+            }
         }
 
         // Validate connection config
@@ -292,10 +296,12 @@ impl BackoffConfig {
 /// Health monitoring configuration
 #[derive(Debug, Clone)]
 pub struct HealthConfig {
-    /// Interval for sending WebSocket pings
-    pub ping_interval: Duration,
-    /// Timeout for receiving a pong response
-    pub pong_timeout: Duration,
+    /// Interval for sending WebSocket pings. None = disable ping entirely.
+    /// Disable when the data stream itself serves as a heartbeat (e.g., price feeds).
+    pub ping_interval: Option<Duration>,
+    /// Timeout for receiving a pong response. None = disable pong checking.
+    /// Only meaningful when ping_interval is Some.
+    pub pong_timeout: Option<Duration>,
     /// Timeout for receiving any data (message or heartbeat)
     pub data_timeout: Duration,
     /// Number of consecutive failures before marking unhealthy
@@ -305,8 +311,8 @@ pub struct HealthConfig {
 impl Default for HealthConfig {
     fn default() -> Self {
         Self {
-            ping_interval: Duration::from_secs(20),
-            pong_timeout: Duration::from_secs(10),
+            ping_interval: Some(Duration::from_secs(20)),
+            pong_timeout: Some(Duration::from_secs(10)),
             data_timeout: Duration::from_secs(30),
             failure_threshold: 3,
         }
