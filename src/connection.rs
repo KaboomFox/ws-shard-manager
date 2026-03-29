@@ -474,6 +474,19 @@ impl<H: WebSocketHandler> Connection<H> {
                                     break;
                                 }
                                 _ => {
+                                    // Check for text-based PONG response (e.g. Polymarket sends "PONG" as text)
+                                    if let Message::Text(ref text) = message {
+                                        let expected_pong = self.health_config.text_pong
+                                            .as_deref()
+                                            .unwrap_or("PONG");
+                                        if self.health_config.text_ping.is_some() && text == expected_pong {
+                                            debug!("[SHARD-{}] Received text pong", self.shard_id);
+                                            health.record_pong_received();
+                                            self.metrics.record_pong();
+                                            continue;
+                                        }
+                                    }
+
                                     // Only count actual data messages for data timeout
                                     // (not ping/pong which keep connection alive but don't indicate data flow)
                                     health.record_data_received();
@@ -614,7 +627,12 @@ impl<H: WebSocketHandler> Connection<H> {
 
                     // Send ping if needed
                     if health.should_send_ping() {
-                        if let Err(e) = write.send(Message::Ping(ping_data.clone())).await {
+                        let ping_msg = if let Some(ref text) = self.health_config.text_ping {
+                            Message::Text(text.clone())
+                        } else {
+                            Message::Ping(ping_data.clone())
+                        };
+                        if let Err(e) = write.send(ping_msg).await {
                             warn!("[SHARD-{}] Failed to send ping: {}", self.shard_id, e);
                             break;
                         }

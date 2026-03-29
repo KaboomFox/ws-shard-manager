@@ -306,6 +306,15 @@ pub struct HealthConfig {
     pub data_timeout: Duration,
     /// Number of consecutive failures before marking unhealthy
     pub failure_threshold: u32,
+    /// Send ping as a text message instead of WS protocol PING frame.
+    /// Some servers (e.g. Polymarket) use application-level "PING"/"PONG" text messages
+    /// rather than WS-level ping/pong frames.
+    /// When set, the string is sent as `Message::Text` and the corresponding
+    /// text pong response is treated as a successful pong.
+    pub text_ping: Option<String>,
+    /// Expected text pong response. Only used when `text_ping` is Some.
+    /// Defaults to "PONG" if not set.
+    pub text_pong: Option<String>,
 }
 
 impl Default for HealthConfig {
@@ -315,6 +324,8 @@ impl Default for HealthConfig {
             pong_timeout: Some(Duration::from_secs(10)),
             data_timeout: Duration::from_secs(30),
             failure_threshold: 3,
+            text_ping: None,
+            text_pong: None,
         }
     }
 }
