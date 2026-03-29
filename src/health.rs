@@ -161,6 +161,7 @@ mod tests {
             pong_timeout: Some(Duration::from_millis(50)),
             data_timeout: Duration::from_millis(200),
             failure_threshold: 3,
+            ..Default::default()
         }
     }
 
