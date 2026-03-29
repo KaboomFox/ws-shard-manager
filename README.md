@@ -25,7 +25,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ws-shard-manager = "0.1"
+ws-shard-manager = "0.2"
 ```
 
 ## Quick Start
