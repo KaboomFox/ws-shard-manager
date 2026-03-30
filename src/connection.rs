@@ -487,14 +487,19 @@ impl<H: WebSocketHandler> Connection<H> {
                                         }
                                     }
 
-                                    // Only count actual data messages for data timeout
-                                    // (not ping/pong which keep connection alive but don't indicate data flow)
-                                    health.record_data_received();
-
                                     // Check for application-level heartbeat
                                     if self.handler.is_heartbeat(&message) {
                                         debug!("[SHARD-{}] Received application heartbeat", self.shard_id);
+                                        // Don't count heartbeats as data — they keep the
+                                        // connection alive but don't indicate actual data flow.
+                                        // Without this, heartbeats reset data_timeout and
+                                        // mask stale connections that stop sending real data.
+                                        continue;
                                     }
+
+                                    // Only count actual data messages for data timeout
+                                    // (not ping/pong/heartbeats which keep connection alive but don't indicate data flow)
+                                    health.record_data_received();
 
                                     // Validate sequence number before processing
                                     let validation = self.handler.validate_sequence(&message, state);
