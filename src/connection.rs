@@ -497,9 +497,16 @@ impl<H: WebSocketHandler> Connection<H> {
                                         continue;
                                     }
 
-                                    // Only count actual data messages for data timeout
-                                    // (not ping/pong/heartbeats which keep connection alive but don't indicate data flow)
-                                    health.record_data_received();
+                                    // Only count actual data messages for data timeout. The
+                                    // handler decides what constitutes "data" vs wire-level
+                                    // keepalives (subscription acks, status frames, empty-text
+                                    // pings, etc.) that keep the connection alive but don't
+                                    // indicate the subscription is actively delivering. Without
+                                    // this gate, such traffic would mask a silently broken
+                                    // subscription by perpetually resetting the data timer.
+                                    if self.handler.is_data_message(&message) {
+                                        health.record_data_received();
+                                    }
 
                                     // Validate sequence number before processing
                                     let validation = self.handler.validate_sequence(&message, state);

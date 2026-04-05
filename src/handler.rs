@@ -220,6 +220,41 @@ pub trait WebSocketHandler: Send + Sync + 'static {
         false
     }
 
+    /// Returns `true` if the message represents actual application-level data flow
+    /// that should reset the data timeout.
+    ///
+    /// Override this when your protocol mixes real data messages with
+    /// keepalives, subscription acks, status frames, or other wire traffic that
+    /// keeps the connection alive but does not indicate the subscription is
+    /// actively delivering data. Without this, any text traffic from the server
+    /// will reset the data timeout and mask a silently broken subscription.
+    ///
+    /// Messages classified as pings, pongs, or heartbeats are always filtered
+    /// separately — this method only sees messages that weren't already filtered
+    /// by those paths.
+    ///
+    /// Default implementation returns `true` for all messages (backward-compatible
+    /// behavior: any non-ping/non-pong/non-heartbeat message counts as data).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// fn is_data_message(&self, message: &Message) -> bool {
+    ///     let Message::Text(text) = message else {
+    ///         return false;
+    ///     };
+    ///     // Only count messages that parse as a real price update
+    ///     serde_json::from_str::<MyProtocolMsg>(text)
+    ///         .ok()
+    ///         .and_then(|m| m.payload)
+    ///         .map(|p| p.has_data())
+    ///         .unwrap_or(false)
+    /// }
+    /// ```
+    fn is_data_message(&self, _message: &Message) -> bool {
+        true
+    }
+
     // =========================================================================
     // Sequence Validation (Optional)
     // =========================================================================
